@@ -415,12 +415,15 @@ int runInstallCheck() {
     // (per WS2-D in mailspring/app/src/mailsync-process.ts), there is
     // no Foundry to ping; report "skipped" so the install-check UI
     // does not show an error and does not transmit anything.
+    //
+    // httpError is declared at function scope because the overall
+    // success check at the bottom of runInstallCheck() reads it.
+    string httpError = "";
+    long httpCode = 0;
     string identityServer = MailUtils::getEnvUTF8("IDENTITY_SERVER");
     if (identityServer.empty()) {
         resp["http_check"] = {{"status", "skipped (Actuna Mail: no Foundry identity server)"}};
     } else {
-        string httpError = "";
-        long httpCode = 0;
         try {
             string pingUrl = identityServer + "/ping";
             CURL * curl_handle = CreateJSONRequest(pingUrl, "GET");
