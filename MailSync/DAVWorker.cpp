@@ -558,22 +558,27 @@ shared_ptr<ContactBook> DAVWorker::resolveAddressBook() {
     }
     
     string cardHost = "";
-    
-    // Try to use DNS SRV records to find the principal URL. We do this through a server API so that
-    // we don't have to compile C++ that does DNS lookups. On Win it's a pain and on Linux it generates
-    // a binary that is bound to a specific version of glibc which generates relocation errors when
-    // run on Ubuntu 18.
-    string domain = account->emailAddress().substr(account->emailAddress().find("@") + 1);
-    string imapHost = account->IMAPHost();
-    json payload = {{"domain", domain}, {"imapHost", imapHost}};
-    json result = PerformJSONRequest(CreateIdentityRequest("/api/resolve-dav-hosts", "POST", payload.dump().c_str()));
-    
-    if (result.count("carddavHost")) {
-        cardHost = result["carddavHost"].get<string>();
-    }
-    
+
+    // WS2-F (Actuna Mail): Foundry's /api/resolve-dav-hosts is the one
+    // backend endpoint that fired even without a Mailspring identity
+    // (analysis/06 D4). It posted {domain, imapHost} of the user's
+    // account to id.getmailspring.com. Skipped here. Users wanting
+    // CardDAV/CalDAV must configure host explicitly in Account
+    // settings; auto-discovery via Foundry is not used.
+    //
+    // Upstream behaviour for reference:
+    //   string domain = account->emailAddress().substr(...);
+    //   string imapHost = account->IMAPHost();
+    //   json payload = {{"domain", domain}, {"imapHost", imapHost}};
+    //   json result = PerformJSONRequest(CreateIdentityRequest(
+    //       "/api/resolve-dav-hosts", "POST", payload.dump().c_str()));
+    //
+    // The CreateIdentityRequest call would now throw on empty
+    // IDENTITY_SERVER (WS2-F NetworkRequestUtils patch), but we skip
+    // the call site explicitly so we don't pollute the log with
+    // SyncException entries on every account add.
     if (cardHost == "") {
-        // No luck.
+        // No discovery; fall through to existing or null.
         return existing;
     }
 
@@ -640,17 +645,11 @@ shared_ptr<ContactBook> DAVWorker::resolveAddressBook() {
  Throws SyncException on transient errors; caller handles.
 */
 string DAVWorker::resolveCalendarHomeURL() {
-    string domain = account->emailAddress().substr(account->emailAddress().find("@") + 1);
-    string imapHost = account->IMAPHost();
-    json payload = {{"domain", domain}, {"imapHost", imapHost}};
-    json result = PerformJSONRequest(
-        CreateIdentityRequest("/api/resolve-dav-hosts", "POST", payload.dump().c_str())
-    );
-
+    // WS2-F (Actuna Mail): see resolveAddressBook above. CalDAV
+    // auto-discovery via Foundry's /api/resolve-dav-hosts is removed.
+    // Caller treats empty as "no CalDAV" and skips calendar sync for
+    // accounts that did not provide an explicit CalDAV host.
     string caldavHost = "";
-    if (result.count("caldavHost")) {
-        caldavHost = result["caldavHost"].get<string>();
-    }
     if (caldavHost == "") {
         return "";
     }

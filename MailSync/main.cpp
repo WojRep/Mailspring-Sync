@@ -408,35 +408,44 @@ int runInstallCheck() {
         {"log", nullptr}
     };
 
-    // Step 1: Check HTTP connectivity to identity server using curl
-    string httpError = "";
-    long httpCode = 0;
-    try {
-        string identityServer = MailUtils::getEnvUTF8("IDENTITY_SERVER");
-        string pingUrl = identityServer + "/ping";
-        CURL * curl_handle = CreateJSONRequest(pingUrl, "GET");
-
-        string result;
-        curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, _onAppendToString);
-        curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&result);
-
-        CURLcode res = curl_easy_perform(curl_handle);
-        if (res != CURLE_OK) {
-            httpError = string("curl error: ") + curl_easy_strerror(res);
-        } else {
-            curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &httpCode);
-            // Any HTTP response code means curl and SSL worked
-        }
-        // Use shared cleanup which also frees the header list
-        CleanupCurlRequest(curl_handle);
-    } catch (std::exception & ex) {
-        httpError = ex.what();
-    }
-
-    if (httpError != "") {
-        resp["http_check"] = {{"error", httpError}};
+    // Step 1: HTTP connectivity check.
+    // WS2-F (Actuna Mail): the upstream check pinged
+    // <IDENTITY_SERVER>/ping (i.e. id.getmailspring.com/ping) to verify
+    // the user's network reaches Foundry. With IDENTITY_SERVER empty
+    // (per WS2-D in mailspring/app/src/mailsync-process.ts), there is
+    // no Foundry to ping; report "skipped" so the install-check UI
+    // does not show an error and does not transmit anything.
+    string identityServer = MailUtils::getEnvUTF8("IDENTITY_SERVER");
+    if (identityServer.empty()) {
+        resp["http_check"] = {{"status", "skipped (Actuna Mail: no Foundry identity server)"}};
     } else {
-        resp["http_check"] = {{"status_code", httpCode}};
+        string httpError = "";
+        long httpCode = 0;
+        try {
+            string pingUrl = identityServer + "/ping";
+            CURL * curl_handle = CreateJSONRequest(pingUrl, "GET");
+
+            string result;
+            curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, _onAppendToString);
+            curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&result);
+
+            CURLcode res = curl_easy_perform(curl_handle);
+            if (res != CURLE_OK) {
+                httpError = string("curl error: ") + curl_easy_strerror(res);
+            } else {
+                curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &httpCode);
+                // Any HTTP response code means curl and SSL worked
+            }
+            CleanupCurlRequest(curl_handle);
+        } catch (std::exception & ex) {
+            httpError = ex.what();
+        }
+
+        if (httpError != "") {
+            resp["http_check"] = {{"error", httpError}};
+        } else {
+            resp["http_check"] = {{"status_code", httpCode}};
+        }
     }
 
     // Step 2: Check IMAP connectivity to Gmail to verify SSL libraries work
@@ -773,9 +782,13 @@ string exectuablePath = argv[0];
     
     // check required environment
     string eConfigDirPath = MailUtils::getEnvUTF8("CONFIG_DIR_PATH");
+    // WS2-F (Actuna Mail): IDENTITY_SERVER is intentionally allowed to be
+    // empty. The Electron parent process passes "" so no Foundry endpoint
+    // is reachable; CONFIG_DIR_PATH alone is required to start mailsync.
     string eIdentityServer = MailUtils::getEnvUTF8("IDENTITY_SERVER");
+    (void)eIdentityServer; // retained for diagnostic logging only
 
-    if ((eConfigDirPath == "") || (eIdentityServer == "")) {
+    if (eConfigDirPath == "") {
         option::printUsage(std::cout, usage);
         return 1;
     }
