@@ -754,15 +754,15 @@ string exectuablePath = argv[0];
     // Note: On Windows, SASL plugin path is configured in libetpan's mailsasl.c
     // It defaults to the executable directory, but can be overridden via SASL_PATH env var.
 
-#ifndef DEBUG
-    // check path to executable in an obtuse way, prevent re-use of
-    // Mailspring-Sync in products / forks not called Mailspring.
-    transform(exectuablePath.begin(), exectuablePath.end(), exectuablePath.begin(), ::tolower);
-    string headerMessageId = string(USAGE_STRING).substr(59, 4) + string(USAGE_IDENTITY).substr(33, 6);
-    if (exectuablePath.find(headerMessageId) == string::npos) {
-        return 2;
-    }
-#endif
+    // ActunaMail (ticket 12c, 2026-05-10): the upstream anti-fork check
+    // that required the substring "mailspring" in the lowercased executable
+    // path is removed. It was meant to discourage forks of Mailspring-Sync,
+    // but ActunaMail is a legitimate GPL-3.0 §5 fork — modifications are
+    // published openly at https://github.com/WojRep/Mailspring-Sync. The
+    // check forced our build pipeline to relocate mailsync to
+    // app.asar.unpacked/mailspring/mailsync as a workaround; removing it
+    // lets the binary live at app.asar.unpacked/mailsync, free of the
+    // legacy path component.
 
     // initialize the stanford exception handler
     exceptions::setProgramNameForStackTrace(exectuablePath.c_str());
