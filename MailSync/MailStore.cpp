@@ -78,8 +78,42 @@ bool MessageAttributesMatch(MessageAttributes a, MessageAttributes b) {
 
 #pragma mark MailStore
 
+// Ticket 45d HOTFIX — open edgehill.db and bind the SQLCipher key as the
+// VERY FIRST operation on the connection, before any prepared statement
+// touches a database page.
+//
+// Why a helper instead of keying in the constructor body: the MailStore
+// member-initializer list constructs `_db` and then immediately prepares
+// `_stmtBeginTransaction` ("BEGIN IMMEDIATE TRANSACTION") and the other
+// statement members. `sqlite3_prepare_v2` reads schema pages — which for
+// a SQLCipher connection REQUIRES the key to already be set. A PRAGMA key
+// in the constructor BODY runs after the initializer list, i.e. too late:
+// mailsync would initialise edgehill.db as a PLAINTEXT database, the
+// renderer (always keyed) would then fail to open it ("file is not a
+// database"), triggering reset → archive → restart loop.
+//
+// This helper guarantees: open → PRAGMA key → return (move). The keyed
+// Database is then moved into `_db`, so the statement members in the
+// initializer list prepare against an already-keyed connection.
+//
+// MAILSPRING_DB_KEY is the hex-encoded 32-byte key from the Electron
+// parent (mailsync-process.ts, ticket 45c). main.cpp refuses to start
+// for DB-touching modes if it is empty/malformed, so by the time any
+// MailStore is constructed the key is present and well-formed.
+static SQLite::Database openEdgehillDatabase() {
+    string path = MailUtils::getEnvUTF8("CONFIG_DIR_PATH") + FS_PATH_SEP + "edgehill.db";
+    SQLite::Database db(path, SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);
+    string dbKeyHex = MailUtils::getEnvUTF8("MAILSPRING_DB_KEY");
+    if (!dbKeyHex.empty()) {
+        // PRAGMA key is the SQLCipher keying operation — must precede any
+        // page read. Binds AES-256-CBC + HMAC page codec (sqlite3mc).
+        SQLite::Statement(db, "PRAGMA key = \"x'" + dbKeyHex + "'\"").executeStep();
+    }
+    return db;
+}
+
 MailStore::MailStore() :
-    _db(MailUtils::getEnvUTF8("CONFIG_DIR_PATH") + FS_PATH_SEP + "edgehill.db", SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE),
+    _db(openEdgehillDatabase()),
     _stmtBeginTransaction(_db, "BEGIN IMMEDIATE TRANSACTION"),
     _stmtRollbackTransaction(_db, "ROLLBACK"),
     _stmtCommitTransaction(_db, "COMMIT"),
@@ -88,24 +122,6 @@ MailStore::MailStore() :
     _labelCache()
 {
     _db.setBusyTimeout(10 * 1000);
-
-    // Ticket 45d (SQLCipher Tier A) — PRAGMA key MUST be the first
-    // statement on a SQLCipher connection, before journal_mode /
-    // page_size / cache_size / synchronous. The JS-side companion is
-    // app-client/app/src/flux/stores/database-store.ts (ticket 45b).
-    //
-    // Env var MAILSPRING_DB_KEY is the hex-encoded 32-byte database
-    // key set by the Electron parent process (mailsync-process.ts:160,
-    // ticket 45c). When empty (pre-encryption builds OR pre-45d.2
-    // amalgamation swap), this is a no-op against stock SQLite:
-    // PRAGMA key on a non-SQLCipher build silently returns OK and does
-    // not bind any cipher engine. After 45d.2 + SQLITE_HAS_CODEC=1
-    // build, this binds the SQLCipher AES-256-CBC + HMAC-SHA512 page
-    // codec.
-    string dbKeyHex = MailUtils::getEnvUTF8("MAILSPRING_DB_KEY");
-    if (!dbKeyHex.empty()) {
-        SQLite::Statement(_db, "PRAGMA key = \"x'" + dbKeyHex + "'\"").executeStep();
-    }
 
     // Note: These are properties of the connection, so they must be set regardless
     // of whether the database setup queries are run.

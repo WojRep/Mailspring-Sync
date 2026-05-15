@@ -800,26 +800,37 @@ string exectuablePath = argv[0];
         return 1;
     }
 
-    // Ticket 45d (SQLCipher Tier A) — validate MAILSPRING_DB_KEY env var
-    // if present. Allowed to be empty during pre-encryption transition
-    // (pre-45d.2 amalgamation swap). When non-empty, must be exactly
-    // 64 hex chars (= 32 bytes / 256 bits for SQLCipher v4 default).
-    // Malformed key → refuse to start (would PRAGMA key with garbage
-    // and corrupt the codec state).
+    // Ticket 45d HOTFIX (SQLCipher Tier A) — validate MAILSPRING_DB_KEY.
+    //
+    // Post-amalgamation-swap (45d.2) edgehill.db is SQLCipher-encrypted.
+    // An empty key here would make MailStore open/create the database as
+    // PLAINTEXT — which the renderer (always keyed) then cannot read,
+    // causing a reset → archive → restart loop. So an empty key is now
+    // FATAL, not "permitted": refuse to start. The Electron parent
+    // (mailsync-process.ts) always passes the key obtained from
+    // KeyManager.getDBKey(); an empty value signals a real bug upstream
+    // and must fail loudly rather than silently degrade to plaintext.
+    //
+    // When non-empty, the key must be exactly 64 hex chars (= 32 bytes /
+    // 256 bits, SQLCipher v4 default). Malformed → refuse to start.
     string eDbKey = MailUtils::getEnvUTF8("MAILSPRING_DB_KEY");
-    if (!eDbKey.empty()) {
-        if (eDbKey.length() != 64) {
-            std::cerr << "MAILSPRING_DB_KEY: expected 64 hex chars (32 bytes), got "
-                      << eDbKey.length() << ". Refusing to start." << std::endl;
+    if (eDbKey.empty()) {
+        std::cerr << "MAILSPRING_DB_KEY is empty. ActunaMail v0.3+ stores edgehill.db "
+                     "encrypted (SQLCipher Tier A); mailsync cannot run without the "
+                     "database key. Refusing to start." << std::endl;
+        return 1;
+    }
+    if (eDbKey.length() != 64) {
+        std::cerr << "MAILSPRING_DB_KEY: expected 64 hex chars (32 bytes), got "
+                  << eDbKey.length() << ". Refusing to start." << std::endl;
+        return 1;
+    }
+    for (char c : eDbKey) {
+        bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!ok) {
+            std::cerr << "MAILSPRING_DB_KEY: contains non-hex character. Refusing to start."
+                      << std::endl;
             return 1;
-        }
-        for (char c : eDbKey) {
-            bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-            if (!ok) {
-                std::cerr << "MAILSPRING_DB_KEY: contains non-hex character. Refusing to start."
-                          << std::endl;
-                return 1;
-            }
         }
     }
 
