@@ -88,10 +88,28 @@ MailStore::MailStore() :
     _labelCache()
 {
     _db.setBusyTimeout(10 * 1000);
-    
+
+    // Ticket 45d (SQLCipher Tier A) — PRAGMA key MUST be the first
+    // statement on a SQLCipher connection, before journal_mode /
+    // page_size / cache_size / synchronous. The JS-side companion is
+    // app-client/app/src/flux/stores/database-store.ts (ticket 45b).
+    //
+    // Env var MAILSPRING_DB_KEY is the hex-encoded 32-byte database
+    // key set by the Electron parent process (mailsync-process.ts:160,
+    // ticket 45c). When empty (pre-encryption builds OR pre-45d.2
+    // amalgamation swap), this is a no-op against stock SQLite:
+    // PRAGMA key on a non-SQLCipher build silently returns OK and does
+    // not bind any cipher engine. After 45d.2 + SQLITE_HAS_CODEC=1
+    // build, this binds the SQLCipher AES-256-CBC + HMAC-SHA512 page
+    // codec.
+    string dbKeyHex = MailUtils::getEnvUTF8("MAILSPRING_DB_KEY");
+    if (!dbKeyHex.empty()) {
+        SQLite::Statement(_db, "PRAGMA key = \"x'" + dbKeyHex + "'\"").executeStep();
+    }
+
     // Note: These are properties of the connection, so they must be set regardless
     // of whether the database setup queries are run.
-    
+
     // https://www.sqlite.org/intern-v-extern-blob.html
     // A database page size of 8192 or 16384 gives the best performance for large BLOB I/O.
     SQLite::Statement(_db, "PRAGMA journal_mode = WAL").executeStep();
