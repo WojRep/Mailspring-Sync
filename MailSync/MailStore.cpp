@@ -96,14 +96,14 @@ bool MessageAttributesMatch(MessageAttributes a, MessageAttributes b) {
 // Database is then moved into `_db`, so the statement members in the
 // initializer list prepare against an already-keyed connection.
 //
-// MAILSPRING_DB_KEY is the hex-encoded 32-byte key from the Electron
+// ACTUNA_DB_KEY is the hex-encoded 32-byte key from the Electron
 // parent (mailsync-process.ts, ticket 45c). main.cpp refuses to start
 // for DB-touching modes if it is empty/malformed, so by the time any
 // MailStore is constructed the key is present and well-formed.
 static SQLite::Database openEdgehillDatabase() {
     string path = MailUtils::getEnvUTF8("CONFIG_DIR_PATH") + FS_PATH_SEP + "edgehill.db";
     SQLite::Database db(path, SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);
-    string dbKeyHex = MailUtils::getEnvUTF8("MAILSPRING_DB_KEY");
+    string dbKeyHex = MailUtils::getEnvUTF8("ACTUNA_DB_KEY");
     if (!dbKeyHex.empty()) {
         // PRAGMA key is the SQLCipher keying operation — must precede any
         // page read. Binds AES-256-CBC + HMAC page codec (sqlite3mc).

@@ -125,11 +125,11 @@ struct CArg: public option::Arg
 };
 
 // Important do not change these without updating result code 2 check below
-// Ticket 45d: MAILSPRING_DB_KEY is the optional 64-hex-char (32-byte)
+// Ticket 45d: ACTUNA_DB_KEY is the optional 64-hex-char (32-byte)
 // SQLCipher database key. Required when SQLCipher binding is active
 // (after 45d.2 SQLITE_HAS_CODEC=1 build + amalgamation swap). Empty
 // permitted for pre-encryption builds.
-#define USAGE_STRING "USAGE: CONFIG_DIR_PATH=/path IDENTITY_SERVER=https://id.getmailspring.com [MAILSPRING_DB_KEY=<64-hex>] mailsync [options]\n\nOptions:"
+#define USAGE_STRING "USAGE: CONFIG_DIR_PATH=/path IDENTITY_SERVER=https://id.getmailspring.com [ACTUNA_DB_KEY=<64-hex>] mailsync [options]\n\nOptions:"
 #define USAGE_IDENTITY "  --identity, -i  \tRequired: Mailspring Identity JSON with credentials."
 
 enum  optionIndex { UNKNOWN, HELP, IDENTITY, ACCOUNT, MODE, ORPHAN, VERBOSE };
@@ -800,7 +800,7 @@ string exectuablePath = argv[0];
         return 1;
     }
 
-    // Ticket 45d HOTFIX (SQLCipher Tier A) — validate MAILSPRING_DB_KEY.
+    // Ticket 45d HOTFIX (SQLCipher Tier A) — validate ACTUNA_DB_KEY.
     //
     // Post-amalgamation-swap (45d.2) edgehill.db is SQLCipher-encrypted.
     // An empty key here would make MailStore open/create the database as
@@ -813,22 +813,22 @@ string exectuablePath = argv[0];
     //
     // When non-empty, the key must be exactly 64 hex chars (= 32 bytes /
     // 256 bits, SQLCipher v4 default). Malformed → refuse to start.
-    string eDbKey = MailUtils::getEnvUTF8("MAILSPRING_DB_KEY");
+    string eDbKey = MailUtils::getEnvUTF8("ACTUNA_DB_KEY");
     if (eDbKey.empty()) {
-        std::cerr << "MAILSPRING_DB_KEY is empty. ActunaMail v0.3+ stores edgehill.db "
+        std::cerr << "ACTUNA_DB_KEY is empty. ActunaMail v0.3+ stores edgehill.db "
                      "encrypted (SQLCipher Tier A); mailsync cannot run without the "
                      "database key. Refusing to start." << std::endl;
         return 1;
     }
     if (eDbKey.length() != 64) {
-        std::cerr << "MAILSPRING_DB_KEY: expected 64 hex chars (32 bytes), got "
+        std::cerr << "ACTUNA_DB_KEY: expected 64 hex chars (32 bytes), got "
                   << eDbKey.length() << ". Refusing to start." << std::endl;
         return 1;
     }
     for (char c : eDbKey) {
         bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
         if (!ok) {
-            std::cerr << "MAILSPRING_DB_KEY: contains non-hex character. Refusing to start."
+            std::cerr << "ACTUNA_DB_KEY: contains non-hex character. Refusing to start."
                       << std::endl;
             return 1;
         }
