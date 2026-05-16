@@ -12,6 +12,7 @@
 #include "MailProcessor.hpp"
 #include "MailStoreTransaction.hpp"
 #include "MailUtils.hpp"
+#include "AttachmentCrypto.hpp"
 #include "File.hpp"
 #include "constants.h"
 
@@ -427,11 +428,17 @@ void MailProcessor::retrievedMessageBody(Message * message, MessageParser * pars
 bool MailProcessor::retrievedFileData(File * file, Data * data) {
     string root = MailUtils::getEnvUTF8("CONFIG_DIR_PATH") + FS_PATH_SEP + "files";
     string path = MailUtils::pathForFile(root, file, true);
+
+    // Ticket 49b — encrypt attachment bytes at-rest before writing to disk.
+    // On-disk format is AENC (AttachmentCrypto), shared with the JS half
+    // (attachment-crypto.ts) so either side can read what the other wrote.
+    string enc = AttachmentCrypto::encrypt(data->bytes(), data->length());
+    Data * encData = Data::dataWithBytes(enc.c_str(), (unsigned int)enc.size());
 #ifdef _MSC_VER
     wstring_convert<codecvt_utf8<wchar_t>, wchar_t> convert;
-    return (data->writeToFile(AS_WIDE_MCSTR(convert.from_bytes(path))) == ErrorNone);
+    return (encData->writeToFile(AS_WIDE_MCSTR(convert.from_bytes(path))) == ErrorNone);
 #else
-    return (data->writeToFile(AS_MCSTR(path)) == ErrorNone);
+    return (encData->writeToFile(AS_MCSTR(path)) == ErrorNone);
 #endif
 }
 

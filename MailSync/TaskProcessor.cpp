@@ -16,6 +16,7 @@
 #include "Thread.hpp"
 #include "Message.hpp"
 #include "MailUtils.hpp"
+#include "AttachmentCrypto.hpp"
 #include "DAVWorker.hpp"
 #include "DAVUtils.hpp"
 #include "GoogleContactsWorker.hpp"
@@ -1514,13 +1515,28 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
         File file{fileJSON};
         string root = MailUtils::getEnvUTF8("CONFIG_DIR_PATH") + FS_PATH_SEP + "files";
         string path = MailUtils::pathForFile(root, &file, false);
-        
+
 #ifdef _MSC_VER
         wstring_convert<codecvt_utf8<wchar_t>, wchar_t> convert;
-        Attachment * a = Attachment::attachmentWithContentsOfFile(AS_WIDE_MCSTR(convert.from_bytes(path)));
+        String * pathStr = AS_WIDE_MCSTR(convert.from_bytes(path));
 #else
-        Attachment * a = Attachment::attachmentWithContentsOfFile(AS_MCSTR(path));
+        String * pathStr = AS_MCSTR(path);
 #endif
+        // Ticket 49b — attachments are encrypted at-rest (AENC). Read the
+        // file, decrypt (legacy plaintext passes through unchanged), and
+        // build the Attachment from the decrypted bytes. attachmentWithData
+        // derives filename + MIME type from pathStr exactly as
+        // attachmentWithContentsOfFile did.
+        Data * raw = Data::dataWithContentsOfFile(pathStr);
+        Attachment * a;
+        if (raw == NULL) {
+            // File missing/unreadable — preserve prior graceful behaviour.
+            a = Attachment::attachmentWithContentsOfFile(pathStr);
+        } else {
+            string plain = AttachmentCrypto::decrypt(raw->bytes(), raw->length());
+            Data * plainData = Data::dataWithBytes(plain.c_str(), (unsigned int)plain.size());
+            a = Attachment::attachmentWithData(pathStr, plainData);
+        }
 
         if (file.contentId().is_string()) {
             a->setContentID(AS_MCSTR(file.contentId().get<string>()));
