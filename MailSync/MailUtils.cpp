@@ -370,21 +370,14 @@ string MailUtils::roleForFolderViaPath(string containerFolderPath, string mainPr
 
     // Lowercase the path
     transform(path.begin(), path.end(), path.begin(), ::tolower);
-    transform(containerFolderPath.begin(), containerFolderPath.end(), containerFolderPath.begin(), ::tolower);
 
-    // ActunaMail no longer recognises a "[Mailspring]" / "Mailspring"
-    // container folder. The only subfolder it ever held was "Snoozed",
-    // backing a Snooze feature removed in WS1-A — so a pre-existing
-    // "Mailspring/Snoozed" folder on a user's server is now treated as an
-    // ordinary folder (visible and manageable), not a hidden role folder.
-    // See backlog ticket #48.
-    if (containerFolderPath != "") {
-      string mailspringPrefix = containerFolderPath + delimiter;
-      transform(mailspringPrefix.begin(), mailspringPrefix.end(), mailspringPrefix.begin(), ::tolower);
-      if (path.size() > mailspringPrefix.size() && path.substr(0, mailspringPrefix.size()) == mailspringPrefix) {
-         return path.substr(mailspringPrefix.size());
-      }
-    }
+    // ActunaMail no longer recognises any "container folder" subfolder as a
+    // role. Upstream Mailspring mapped "[Mailspring]/X", "Mailspring/X" and a
+    // custom-container "<container>/X" to role X — the only such folder ever
+    // used was "Snoozed", backing a Snooze feature removed in WS1-A. A
+    // pre-existing "Mailspring/Snoozed" (or any container subfolder) is now
+    // treated as an ordinary, visible, manageable folder. See ticket #48.
+    (void)containerFolderPath;
 
     // Match against a lookup table of common names
     // [Gmail]/Spam => [gmail]/spam => spam

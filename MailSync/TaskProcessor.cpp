@@ -1401,14 +1401,40 @@ void TaskProcessor::performRemoteDestroyCategory(Task * task) {
     string accountId = task->accountId();
     string path = data["path"].get<string>();
     ErrorCode err = ErrorCode::ErrorNone;
-    
-    session->deleteFolder(AS_MCSTR(path), &err);
-    
+
+    // Delete subfolders first. An IMAP server refuses to DELETE a folder that
+    // still has children, so deleting e.g. "Mailspring" (which contains
+    // "Mailspring/Snoozed") would otherwise fail. Collect every folder at or
+    // below `path`, then delete deepest-first so each parent is empty by the
+    // time we reach it.
+    Array * remoteFolders = session->fetchAllFolders(&err);
     if (err != ErrorNone) {
-        throw SyncException(err, "deleteFolder");
+        throw SyncException(err, "performRemoteDestroyCategory - fetchAllFolders");
     }
-    
-    logger->info("Deletion of folder/label '{}' succeeded.", path);
+
+    vector<string> pathsToDelete;
+    for (unsigned int ii = 0; ii < remoteFolders->count(); ii++) {
+        IMAPFolder * remote = (IMAPFolder *)remoteFolders->objectAtIndex(ii);
+        string remotePath = remote->path()->UTF8Characters();
+        string delimiter {remote->delimiter()};
+        if (remotePath == path || remotePath.substr(0, path.size() + delimiter.size()) == path + delimiter) {
+            pathsToDelete.push_back(remotePath);
+        }
+    }
+
+    // Deepest paths first (a child path is always longer than its parent).
+    sort(pathsToDelete.begin(), pathsToDelete.end(), [](const string & a, const string & b) {
+        return a.size() > b.size();
+    });
+
+    for (string & folderPath : pathsToDelete) {
+        err = ErrorCode::ErrorNone;
+        session->deleteFolder(AS_MCSTR(folderPath), &err);
+        if (err != ErrorNone) {
+            throw SyncException(err, "deleteFolder");
+        }
+        logger->info("Deletion of folder/label '{}' succeeded.", folderPath);
+    }
 }
 
 void TaskProcessor::performRemoteSendDraft(Task * task) {
