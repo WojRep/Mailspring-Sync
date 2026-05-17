@@ -524,55 +524,16 @@ bool SyncWorker::syncNow()
     return syncAgainImmediately;
 }
 
-void SyncWorker::ensureRootMailspringFolder(vector<string> containerFolderComponents, Array * remoteFolders)
-{
-    auto components = Array::array();
-    for (string containerFolderComponent : containerFolderComponents) {
-      components->addObject(AS_MCSTR(containerFolderComponent));
-    }
-    
-    String * desiredPath = session.defaultNamespace()->pathForComponents(components);
-    
-    bool exists = false;
-    for (int ii = ((int)remoteFolders->count()) - 1; ii >= 0; ii--) {
-        IMAPFolder * remote = (IMAPFolder *)remoteFolders->objectAtIndex(ii);
-        if (remote->path()->isEqual(desiredPath)) {
-            exists = true;
-        }
-    }
-    
-    if (!exists) {
-        ErrorCode err = ErrorCode::ErrorNone;
-        session.createFolder(desiredPath, &err);
-        if (err) {
-            logger->error("Could not create Mailspring container folder: {}. {}", desiredPath->UTF8Characters(), ErrorCodeToTypeMap[err]);
-        } else {
-            logger->error("Created Mailspring container folder: {}.", desiredPath->UTF8Characters());
-        }
-    }
-}
-
 vector<shared_ptr<Folder>> SyncWorker::syncFoldersAndLabels()
 {
     // allocated mailcore objects freed when `pool` is removed from the stack
     AutoreleasePool pool;
 
+    logger->info("Syncing folder list...");
+
+    // `containerFolderPath` is still needed below to recognise the role of
+    // folders that already live under a container on the server.
     string containerFolderPath = account->containerFolder();
-    vector<string> containerFolderComponents;
-
-    if (containerFolderPath == "" || containerFolderPath == MAILSPRING_FOLDER_PREFIX_V2) {
-      logger->info("Syncing folder list...");
-      containerFolderComponents.push_back(MAILSPRING_FOLDER_PREFIX_V2);
-    } else {
-      logger->info("Syncing folder list on custom container folder {} ...", containerFolderPath);
-
-      std::stringstream data(containerFolderPath);
-      std::string folder;
-      while(std::getline(data, folder, '/'))
-      {
-        containerFolderComponents.push_back(folder);
-      }
-    }
 
     ErrorCode err = ErrorCode::ErrorNone;
     Array * remoteFolders = session.fetchAllFolders(&err);
@@ -581,52 +542,19 @@ vector<shared_ptr<Folder>> SyncWorker::syncFoldersAndLabels()
     }
 
     string mainPrefix = MailUtils::namespacePrefixOrBlank(&session);
-    bool ensuredRoot = false;
-    
-    // create required Mailspring folders if they don't exist
-    // TODO: Consolidate this into role association code below, and make it
-    // use the same business logic as creating / updating folders from tasks.
-    vector<string> mailspringFolders{"Snoozed"};
 
-    for (string mailspringFolder : mailspringFolders) {
-        string mailspringRole = mailspringFolder;
-        transform(mailspringRole.begin(), mailspringRole.end(), mailspringRole.begin(), ::tolower);
+    // ActunaMail does NOT create a server-side container folder. Upstream
+    // Mailspring created a "Mailspring/Snoozed" folder on every user's IMAP
+    // server to back the Snooze feature; that plugin was removed in WS1-A,
+    // leaving the folder permanently dead — and a literal "Mailspring"
+    // folder visible in every other mail client is a brand leak.
+    //
+    // We therefore no longer create the container folder or any subfolder.
+    // Folders that ALREADY exist on a user's server are left completely
+    // untouched (no server-side deletion) and are still recognised by role
+    // via MailUtils::roleForFolder below, so a pre-existing "Mailspring/
+    // Snoozed" keeps its `snoozed` role. See backlog ticket #48.
 
-        bool exists = false;
-        for (int ii = ((int)remoteFolders->count()) - 1; ii >= 0; ii--) {
-            IMAPFolder * remote = (IMAPFolder *)remoteFolders->objectAtIndex(ii);
-            string remoteRole = MailUtils::roleForFolder(containerFolderPath, mainPrefix, remote);
-            if (remoteRole == mailspringRole) {
-                exists = true;
-                break;
-            }
-        }
-        if (!exists) {
-            if (!ensuredRoot) {
-                ensureRootMailspringFolder(containerFolderComponents, remoteFolders);
-                ensuredRoot = true;
-            }
-            
-            auto components = Array::array();
-            for (string containerFolderComponent : containerFolderComponents) {
-              components->addObject(AS_MCSTR(containerFolderComponent));
-            }
-            components->addObject(AS_MCSTR(mailspringFolder));
-            String * desiredPath = session.defaultNamespace()->pathForComponents(components);
-            session.createFolder(desiredPath, &err);
-            if (err) {
-                logger->error("Could not create required Mailspring folder: {}. {}", desiredPath->UTF8Characters(), ErrorCodeToTypeMap[err]);
-                continue;
-            }
-            logger->error("Created required Mailspring folder: {}.", desiredPath->UTF8Characters());
-            IMAPFolder * fake = new IMAPFolder();
-            fake->autorelease();
-            fake->setPath(desiredPath);
-            fake->setDelimiter(session.defaultNamespace()->mainDelimiter());
-            remoteFolders->addObject(fake);
-        }
-    }
-    
     // sync with the local store
     vector<shared_ptr<Folder>> foldersToSync{};
 
