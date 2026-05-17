@@ -1396,22 +1396,11 @@ void TaskProcessor::performRemoteSyncbackMetadata(Task * task) {
     logger->info("Syncback of metadata {}:{} = {} succeeded.", id, pluginId, payload.dump());
 }
 
-void TaskProcessor::performRemoteDestroyCategory(Task * task) {
-    json & data = task->data();
-    string accountId = task->accountId();
-    string path = data["path"].get<string>();
-    ErrorCode err = ErrorCode::ErrorNone;
-
-    // Delete subfolders first. An IMAP server refuses to DELETE a folder that
-    // still has children, so deleting e.g. "Mailspring" (which contains
-    // "Mailspring/Snoozed") would otherwise fail. Collect every folder at or
-    // below `path`, then delete deepest-first so each parent is empty by the
-    // time we reach it.
-    Array * remoteFolders = session->fetchAllFolders(&err);
-    if (err != ErrorNone) {
-        throw SyncException(err, "performRemoteDestroyCategory - fetchAllFolders");
-    }
-
+// Permanently delete `path` and every folder below it. An IMAP server
+// refuses to DELETE a folder that still has children, so children are
+// collected and deleted deepest-first. Nothing here is recoverable — only
+// call this for a folder that already lives inside Trash.
+void TaskProcessor::destroyFolderTreePermanently(string path, Array * remoteFolders) {
     vector<string> pathsToDelete;
     for (unsigned int ii = 0; ii < remoteFolders->count(); ii++) {
         IMAPFolder * remote = (IMAPFolder *)remoteFolders->objectAtIndex(ii);
@@ -1428,13 +1417,101 @@ void TaskProcessor::performRemoteDestroyCategory(Task * task) {
     });
 
     for (string & folderPath : pathsToDelete) {
-        err = ErrorCode::ErrorNone;
+        ErrorCode err = ErrorCode::ErrorNone;
         session->deleteFolder(AS_MCSTR(folderPath), &err);
         if (err != ErrorNone) {
             throw SyncException(err, "deleteFolder");
         }
-        logger->info("Deletion of folder/label '{}' succeeded.", folderPath);
+        logger->info("Permanent deletion of folder '{}' succeeded.", folderPath);
     }
+}
+
+void TaskProcessor::performRemoteDestroyCategory(Task * task) {
+    json & data = task->data();
+    string accountId = task->accountId();
+    string path = data["path"].get<string>();
+    ErrorCode err = ErrorCode::ErrorNone;
+
+    Array * remoteFolders = session->fetchAllFolders(&err);
+    if (err != ErrorNone) {
+        throw SyncException(err, "performRemoteDestroyCategory - fetchAllFolders");
+    }
+
+    string mainPrefix = MailUtils::namespacePrefixOrBlank(session);
+    string containerFolderPath = account->containerFolder();
+
+    // Locate the folder being deleted (for its delimiter) and the account's
+    // Trash folder.
+    bool targetExists = false;
+    string delimiter = "/";
+    string trashPath = "";
+    for (unsigned int ii = 0; ii < remoteFolders->count(); ii++) {
+        IMAPFolder * remote = (IMAPFolder *)remoteFolders->objectAtIndex(ii);
+        string remotePath = remote->path()->UTF8Characters();
+        if (remotePath == path) {
+            targetExists = true;
+            delimiter = string {remote->delimiter()};
+        }
+        if (MailUtils::roleForFolder(containerFolderPath, mainPrefix, remote) == "trash") {
+            trashPath = remotePath;
+        }
+    }
+
+    if (!targetExists) {
+        // Already gone on the server — nothing to do (keeps the task idempotent).
+        logger->info("Folder '{}' no longer exists on the server; skipping.", path);
+        return;
+    }
+
+    // If the folder already lives inside Trash, this deletion is the user
+    // removing it FROM Trash — delete it permanently. Same when the account
+    // has no Trash folder at all (nowhere safer to put it).
+    bool alreadyInTrash = (trashPath != "") &&
+        (path == trashPath ||
+         path.substr(0, trashPath.size() + delimiter.size()) == trashPath + delimiter);
+
+    if (alreadyInTrash || trashPath == "") {
+        if (trashPath == "") {
+            logger->info("No Trash folder for account; deleting '{}' permanently.", path);
+        }
+        destroyFolderTreePermanently(path, remoteFolders);
+        return;
+    }
+
+    // Otherwise move the whole folder — its subtree and every message in it —
+    // into Trash via IMAP RENAME. IMAP renames inferior folders along with
+    // their parent, so the entire structure is preserved and recoverable.
+    // Deleting it again (now from Trash) removes it permanently.
+    string leaf = path;
+    size_t lastSep = path.rfind(delimiter);
+    if (lastSep != string::npos) {
+        leaf = path.substr(lastSep + delimiter.size());
+    }
+    string destination = trashPath + delimiter + leaf;
+
+    // Avoid a collision with an existing folder of the same name in Trash.
+    int suffix = 0;
+    bool collision = true;
+    while (collision) {
+        collision = false;
+        for (unsigned int ii = 0; ii < remoteFolders->count(); ii++) {
+            IMAPFolder * remote = (IMAPFolder *)remoteFolders->objectAtIndex(ii);
+            if (string(remote->path()->UTF8Characters()) == destination) {
+                collision = true;
+                break;
+            }
+        }
+        if (collision) {
+            suffix += 1;
+            destination = trashPath + delimiter + leaf + " (" + to_string(suffix) + ")";
+        }
+    }
+
+    session->renameFolder(AS_MCSTR(path), AS_MCSTR(destination), &err);
+    if (err != ErrorNone) {
+        throw SyncException(err, "renameFolder");
+    }
+    logger->info("Folder '{}' moved to Trash as '{}'.", path, destination);
 }
 
 void TaskProcessor::performRemoteSendDraft(Task * task) {
