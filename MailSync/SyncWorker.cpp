@@ -551,9 +551,10 @@ vector<shared_ptr<Folder>> SyncWorker::syncFoldersAndLabels()
     //
     // We therefore no longer create the container folder or any subfolder.
     // Folders that ALREADY exist on a user's server are left completely
-    // untouched (no server-side deletion) and are still recognised by role
-    // via MailUtils::roleForFolder below, so a pre-existing "Mailspring/
-    // Snoozed" keeps its `snoozed` role. See backlog ticket #48.
+    // untouched (no server-side deletion). The `snoozed` role mapping was
+    // also removed, so a pre-existing "Mailspring/Snoozed" folder now syncs
+    // as an ordinary, visible folder the user can manage or delete itself.
+    // See backlog ticket #48.
 
     // sync with the local store
     vector<shared_ptr<Folder>> foldersToSync{};

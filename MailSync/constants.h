@@ -28,9 +28,6 @@ static string FS_PATH_SEP = "\\";
 static string FS_PATH_SEP = "/";
 #endif
 
-static string MAILSPRING_FOLDER_PREFIX_V1 = "[Mailspring]";
-static string MAILSPRING_FOLDER_PREFIX_V2 = "Mailspring";
-
 static vector<string> ACCOUNT_RESET_QUERIES = {
     "DELETE FROM `ThreadCounts` WHERE `categoryId` IN (SELECT id FROM `Folder` WHERE `accountId` = ?)",
     "DELETE FROM `ThreadCounts` WHERE `categoryId` IN (SELECT id FROM `Label` WHERE `accountId` = ?)",
@@ -289,9 +286,6 @@ static map<string, string> COMMON_FOLDER_NAMES = {
     {"черновики", "drafts"},
     {"draftbox", "drafts"},
     {"robocze", "drafts"},
-
-    {"Mailspring/Snoozed", "snoozed"},
-    {"Mailspring.Snoozed", "snoozed"},
 };
 
 static map<int, string> LibEtPanCodeToTypeMap = {

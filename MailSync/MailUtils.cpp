@@ -310,7 +310,7 @@ string MailUtils::namespacePrefixOrBlank(IMAPSession * session) {
 }
 
 vector<string> MailUtils::roles() {
-    return {"all", "sent", "drafts", "spam", "important", "starred", "archive", "inbox", "trash", "snoozed"};
+    return {"all", "sent", "drafts", "spam", "important", "starred", "archive", "inbox", "trash"};
 }
 
 string MailUtils::roleForFolder(string containerFolderPath, string mainPrefix, IMAPFolder * folder) {
@@ -372,23 +372,14 @@ string MailUtils::roleForFolderViaPath(string containerFolderPath, string mainPr
     transform(path.begin(), path.end(), path.begin(), ::tolower);
     transform(containerFolderPath.begin(), containerFolderPath.end(), containerFolderPath.begin(), ::tolower);
 
-    // In our [Mailspring] subfolder, folder names are roles:
-    // [mailspring]/snoozed = snoozed
-    // [mailspring]/XXX = xxx
-    string mailspringPrefix = MAILSPRING_FOLDER_PREFIX_V1 + delimiter;
-    transform(mailspringPrefix.begin(), mailspringPrefix.end(), mailspringPrefix.begin(), ::tolower);
-    if (path.size() > mailspringPrefix.size() && path.substr(0, mailspringPrefix.size()) == mailspringPrefix) {
-        return path.substr(mailspringPrefix.size());
-    }
-
-           mailspringPrefix = MAILSPRING_FOLDER_PREFIX_V2 + delimiter;
-    transform(mailspringPrefix.begin(), mailspringPrefix.end(), mailspringPrefix.begin(), ::tolower);
-    if (path.size() > mailspringPrefix.size() && path.substr(0, mailspringPrefix.size()) == mailspringPrefix) {
-        return path.substr(mailspringPrefix.size());
-    }
-
+    // ActunaMail no longer recognises a "[Mailspring]" / "Mailspring"
+    // container folder. The only subfolder it ever held was "Snoozed",
+    // backing a Snooze feature removed in WS1-A — so a pre-existing
+    // "Mailspring/Snoozed" folder on a user's server is now treated as an
+    // ordinary folder (visible and manageable), not a hidden role folder.
+    // See backlog ticket #48.
     if (containerFolderPath != "") {
-           mailspringPrefix = containerFolderPath + delimiter;
+      string mailspringPrefix = containerFolderPath + delimiter;
       transform(mailspringPrefix.begin(), mailspringPrefix.end(), mailspringPrefix.begin(), ::tolower);
       if (path.size() > mailspringPrefix.size() && path.substr(0, mailspringPrefix.size()) == mailspringPrefix) {
          return path.substr(mailspringPrefix.size());
