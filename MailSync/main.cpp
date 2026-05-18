@@ -920,9 +920,10 @@ string exectuablePath = argv[0];
     try {
         if (logToFile) {
             // If we're attached to the mail client, log everything to a
-            // rotating log file with the default logger format.
+            // rotating log file. Ticket #04 04d: pino-compatible JSON-line
+            // format so C++ and Electron logs share one schema.
             // IMPORANT: On Windows, only one sync worker can have this file open at once.
-            spdlog::set_formatter(std::make_shared<SPDFormatterWithThreadNames>("%P %+"));
+            spdlog::set_formatter(std::make_shared<SPDJsonFormatter>());
     #if defined(_MSC_VER)
             wstring_convert<codecvt_utf8<wchar_t>, wchar_t> convert;
             wstring logPath = convert.from_bytes(eConfigDirPath) + convert.from_bytes(FS_PATH_SEP + "mailsync-" + account->id() + ".log");

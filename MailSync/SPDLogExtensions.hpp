@@ -74,10 +74,36 @@ public:
 class SPDFormatterWithThreadNames : public spdlog::pattern_formatter {
 public:
     SPDFormatterWithThreadNames(const std::string& pattern) : spdlog::pattern_formatter(pattern) {}
-    
+
     void format(spdlog::details::log_msg& msg) override {
         msg.logger_name = GetThreadName(msg.thread_id);
         spdlog::pattern_formatter::format(msg);
+    }
+};
+
+// Ticket #04 04d — Mandarynka logger. Emits each record as a single
+// pino-compatible JSON line ({level, time, name, msg}) so the mailsync C++
+// log file shares one schema with the Electron-side pino logger.
+class SPDJsonFormatter : public spdlog::formatter {
+public:
+    void format(spdlog::details::log_msg& msg) override {
+        // spdlog level (trace=0 … critical=5, off=6) → pino numeric level.
+        static const int pinoLevels[] = { 10, 20, 30, 40, 50, 60, 60 };
+        int lvl = static_cast<int>(msg.level);
+        if (lvl < 0 || lvl > 6) {
+            lvl = 2; // default to info
+        }
+
+        const std::string * threadName = GetThreadName(msg.thread_id);
+
+        nlohmann::json record;
+        record["level"] = pinoLevels[lvl];
+        record["time"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+            msg.time.time_since_epoch()).count();
+        record["name"] = threadName ? *threadName : std::string("mailsync");
+        record["msg"] = msg.raw.str();
+
+        msg.formatted << record.dump() << spdlog::details::os::eol;
     }
 };
 
