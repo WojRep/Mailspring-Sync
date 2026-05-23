@@ -1,0 +1,35 @@
+StanfordCPPLib — Licensing status (UNRESOLVED)
+==============================================
+
+**WARNING — This vendored copy lacks a clear upstream LICENSE file.**
+
+This directory contains code from the Stanford C++ Library, originally
+developed by Eric Roberts and contributors at Stanford University for the
+CS106B / CS106X introductory programming courses. The upstream historical
+distribution carried different licence statements at different points in
+time (notably a permissive licence in the 2014-era release shipped with
+the textbook "Programming Abstractions in C++").
+
+The Mailspring/ActunaMail vendored copy in this directory **does not
+contain an upstream LICENSE file**, and the in-source comments do not
+declare a licence.
+
+Risk classification (per `analysis/24-license-compliance-audit.md`
+§9 Strefa G.3): **⚠️ unresolved — investigate before commercial
+distribution.**
+
+Mitigation options for ActunaMail:
+
+  1. Locate and incorporate the original Stanford CS106B distribution's
+     licence file (the historical permissive 2014 release), copy it here.
+  2. Contact the original maintainers for clarification.
+  3. Replace use of StanfordCPPLib in mailsync with an alternative
+     (e.g. standard C++ exceptions / error reporting in lieu of
+     `ErrorException`).
+
+Until one of the above is completed, the BETA distribution of ActunaMail
+relies on the academic/educational nature of the original library and
+on Mailspring/Foundry376's prior vendoring of the same copy. This is
+**not** a guarantee of clear commercial-distribution rights.
+
+Tracking ticket: `backlog/75-license-mailsync-vendor-LICENSE-files.md`.
