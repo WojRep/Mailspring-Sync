@@ -16,6 +16,7 @@
 #include "Thread.hpp"
 #include "Message.hpp"
 #include "MailUtils.hpp"
+#include "AttachmentCrypto.hpp"
 #include "DAVWorker.hpp"
 #include "DAVUtils.hpp"
 #include "GoogleContactsWorker.hpp"
@@ -1395,19 +1396,122 @@ void TaskProcessor::performRemoteSyncbackMetadata(Task * task) {
     logger->info("Syncback of metadata {}:{} = {} succeeded.", id, pluginId, payload.dump());
 }
 
+// Permanently delete `path` and every folder below it. An IMAP server
+// refuses to DELETE a folder that still has children, so children are
+// collected and deleted deepest-first. Nothing here is recoverable — only
+// call this for a folder that already lives inside Trash.
+void TaskProcessor::destroyFolderTreePermanently(string path, Array * remoteFolders) {
+    vector<string> pathsToDelete;
+    for (unsigned int ii = 0; ii < remoteFolders->count(); ii++) {
+        IMAPFolder * remote = (IMAPFolder *)remoteFolders->objectAtIndex(ii);
+        string remotePath = remote->path()->UTF8Characters();
+        string delimiter {remote->delimiter()};
+        if (remotePath == path || remotePath.substr(0, path.size() + delimiter.size()) == path + delimiter) {
+            pathsToDelete.push_back(remotePath);
+        }
+    }
+
+    // Deepest paths first (a child path is always longer than its parent).
+    sort(pathsToDelete.begin(), pathsToDelete.end(), [](const string & a, const string & b) {
+        return a.size() > b.size();
+    });
+
+    for (string & folderPath : pathsToDelete) {
+        ErrorCode err = ErrorCode::ErrorNone;
+        session->deleteFolder(AS_MCSTR(folderPath), &err);
+        if (err != ErrorNone) {
+            throw SyncException(err, "deleteFolder");
+        }
+        logger->info("Permanent deletion of folder '{}' succeeded.", folderPath);
+    }
+}
+
 void TaskProcessor::performRemoteDestroyCategory(Task * task) {
     json & data = task->data();
     string accountId = task->accountId();
     string path = data["path"].get<string>();
     ErrorCode err = ErrorCode::ErrorNone;
-    
-    session->deleteFolder(AS_MCSTR(path), &err);
-    
+
+    Array * remoteFolders = session->fetchAllFolders(&err);
     if (err != ErrorNone) {
-        throw SyncException(err, "deleteFolder");
+        throw SyncException(err, "performRemoteDestroyCategory - fetchAllFolders");
     }
-    
-    logger->info("Deletion of folder/label '{}' succeeded.", path);
+
+    string mainPrefix = MailUtils::namespacePrefixOrBlank(session);
+    string containerFolderPath = account->containerFolder();
+
+    // Locate the folder being deleted (for its delimiter) and the account's
+    // Trash folder.
+    bool targetExists = false;
+    string delimiter = "/";
+    string trashPath = "";
+    for (unsigned int ii = 0; ii < remoteFolders->count(); ii++) {
+        IMAPFolder * remote = (IMAPFolder *)remoteFolders->objectAtIndex(ii);
+        string remotePath = remote->path()->UTF8Characters();
+        if (remotePath == path) {
+            targetExists = true;
+            delimiter = string {remote->delimiter()};
+        }
+        if (MailUtils::roleForFolder(containerFolderPath, mainPrefix, remote) == "trash") {
+            trashPath = remotePath;
+        }
+    }
+
+    if (!targetExists) {
+        // Already gone on the server — nothing to do (keeps the task idempotent).
+        logger->info("Folder '{}' no longer exists on the server; skipping.", path);
+        return;
+    }
+
+    // If the folder already lives inside Trash, this deletion is the user
+    // removing it FROM Trash — delete it permanently. Same when the account
+    // has no Trash folder at all (nowhere safer to put it).
+    bool alreadyInTrash = (trashPath != "") &&
+        (path == trashPath ||
+         path.substr(0, trashPath.size() + delimiter.size()) == trashPath + delimiter);
+
+    if (alreadyInTrash || trashPath == "") {
+        if (trashPath == "") {
+            logger->info("No Trash folder for account; deleting '{}' permanently.", path);
+        }
+        destroyFolderTreePermanently(path, remoteFolders);
+        return;
+    }
+
+    // Otherwise move the whole folder — its subtree and every message in it —
+    // into Trash via IMAP RENAME. IMAP renames inferior folders along with
+    // their parent, so the entire structure is preserved and recoverable.
+    // Deleting it again (now from Trash) removes it permanently.
+    string leaf = path;
+    size_t lastSep = path.rfind(delimiter);
+    if (lastSep != string::npos) {
+        leaf = path.substr(lastSep + delimiter.size());
+    }
+    string destination = trashPath + delimiter + leaf;
+
+    // Avoid a collision with an existing folder of the same name in Trash.
+    int suffix = 0;
+    bool collision = true;
+    while (collision) {
+        collision = false;
+        for (unsigned int ii = 0; ii < remoteFolders->count(); ii++) {
+            IMAPFolder * remote = (IMAPFolder *)remoteFolders->objectAtIndex(ii);
+            if (string(remote->path()->UTF8Characters()) == destination) {
+                collision = true;
+                break;
+            }
+        }
+        if (collision) {
+            suffix += 1;
+            destination = trashPath + delimiter + leaf + " (" + to_string(suffix) + ")";
+        }
+    }
+
+    session->renameFolder(AS_MCSTR(path), AS_MCSTR(destination), &err);
+    if (err != ErrorNone) {
+        throw SyncException(err, "renameFolder");
+    }
+    logger->info("Folder '{}' moved to Trash as '{}'.", path, destination);
 }
 
 void TaskProcessor::performRemoteSendDraft(Task * task) {
@@ -1529,13 +1633,28 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
         File file{fileJSON};
         string root = MailUtils::getEnvUTF8("CONFIG_DIR_PATH") + FS_PATH_SEP + "files";
         string path = MailUtils::pathForFile(root, &file, false);
-        
+
 #ifdef _MSC_VER
         wstring_convert<codecvt_utf8<wchar_t>, wchar_t> convert;
-        Attachment * a = Attachment::attachmentWithContentsOfFile(AS_WIDE_MCSTR(convert.from_bytes(path)));
+        String * pathStr = AS_WIDE_MCSTR(convert.from_bytes(path));
 #else
-        Attachment * a = Attachment::attachmentWithContentsOfFile(AS_MCSTR(path));
+        String * pathStr = AS_MCSTR(path);
 #endif
+        // Ticket 49b — attachments are encrypted at-rest (AENC). Read the
+        // file, decrypt (legacy plaintext passes through unchanged), and
+        // build the Attachment from the decrypted bytes. attachmentWithData
+        // derives filename + MIME type from pathStr exactly as
+        // attachmentWithContentsOfFile did.
+        Data * raw = Data::dataWithContentsOfFile(pathStr);
+        Attachment * a;
+        if (raw == NULL) {
+            // File missing/unreadable — preserve prior graceful behaviour.
+            a = Attachment::attachmentWithContentsOfFile(pathStr);
+        } else {
+            string plain = AttachmentCrypto::decrypt(raw->bytes(), raw->length());
+            Data * plainData = Data::dataWithBytes(plain.c_str(), (unsigned int)plain.size());
+            a = Attachment::attachmentWithData(pathStr, plainData);
+        }
 
         if (file.contentId().is_string()) {
             a->setContentID(AS_MCSTR(file.contentId().get<string>()));

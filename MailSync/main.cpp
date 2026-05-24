@@ -125,7 +125,11 @@ struct CArg: public option::Arg
 };
 
 // Important do not change these without updating result code 2 check below
-#define USAGE_STRING "USAGE: CONFIG_DIR_PATH=/path IDENTITY_SERVER=https://id.getmailspring.com mailsync [options]\n\nOptions:"
+// Ticket 45d: ACTUNA_DB_KEY is the optional 64-hex-char (32-byte)
+// SQLCipher database key. Required when SQLCipher binding is active
+// (after 45d.2 SQLITE_HAS_CODEC=1 build + amalgamation swap). Empty
+// permitted for pre-encryption builds.
+#define USAGE_STRING "USAGE: CONFIG_DIR_PATH=/path IDENTITY_SERVER=https://id.getmailspring.com [ACTUNA_DB_KEY=<64-hex>] mailsync [options]\n\nOptions:"
 #define USAGE_IDENTITY "  --identity, -i  \tRequired: Mailspring Identity JSON with credentials."
 
 enum  optionIndex { UNKNOWN, HELP, IDENTITY, ACCOUNT, MODE, ORPHAN, VERBOSE };
@@ -408,35 +412,47 @@ int runInstallCheck() {
         {"log", nullptr}
     };
 
-    // Step 1: Check HTTP connectivity to identity server using curl
+    // Step 1: HTTP connectivity check.
+    // WS2-F (Actuna Mail): the upstream check pinged
+    // <IDENTITY_SERVER>/ping (i.e. id.getmailspring.com/ping) to verify
+    // the user's network reaches Foundry. With IDENTITY_SERVER empty
+    // (per WS2-D in mailspring/app/src/mailsync-process.ts), there is
+    // no Foundry to ping; report "skipped" so the install-check UI
+    // does not show an error and does not transmit anything.
+    //
+    // httpError is declared at function scope because the overall
+    // success check at the bottom of runInstallCheck() reads it.
     string httpError = "";
     long httpCode = 0;
-    try {
-        string identityServer = MailUtils::getEnvUTF8("IDENTITY_SERVER");
-        string pingUrl = identityServer + "/ping";
-        CURL * curl_handle = CreateJSONRequest(pingUrl, "GET");
-
-        string result;
-        curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, _onAppendToString);
-        curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&result);
-
-        CURLcode res = curl_easy_perform(curl_handle);
-        if (res != CURLE_OK) {
-            httpError = string("curl error: ") + curl_easy_strerror(res);
-        } else {
-            curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &httpCode);
-            // Any HTTP response code means curl and SSL worked
-        }
-        // Use shared cleanup which also frees the header list
-        CleanupCurlRequest(curl_handle);
-    } catch (std::exception & ex) {
-        httpError = ex.what();
-    }
-
-    if (httpError != "") {
-        resp["http_check"] = {{"error", httpError}};
+    string identityServer = MailUtils::getEnvUTF8("IDENTITY_SERVER");
+    if (identityServer.empty()) {
+        resp["http_check"] = {{"status", "skipped (Actuna Mail: no Foundry identity server)"}};
     } else {
-        resp["http_check"] = {{"status_code", httpCode}};
+        try {
+            string pingUrl = identityServer + "/ping";
+            CURL * curl_handle = CreateJSONRequest(pingUrl, "GET");
+
+            string result;
+            curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, _onAppendToString);
+            curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&result);
+
+            CURLcode res = curl_easy_perform(curl_handle);
+            if (res != CURLE_OK) {
+                httpError = string("curl error: ") + curl_easy_strerror(res);
+            } else {
+                curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &httpCode);
+                // Any HTTP response code means curl and SSL worked
+            }
+            CleanupCurlRequest(curl_handle);
+        } catch (std::exception & ex) {
+            httpError = ex.what();
+        }
+
+        if (httpError != "") {
+            resp["http_check"] = {{"error", httpError}};
+        } else {
+            resp["http_check"] = {{"status_code", httpCode}};
+        }
     }
 
     // Step 2: Check IMAP connectivity to Gmail to verify SSL libraries work
@@ -742,15 +758,15 @@ string exectuablePath = argv[0];
     // Note: On Windows, SASL plugin path is configured in libetpan's mailsasl.c
     // It defaults to the executable directory, but can be overridden via SASL_PATH env var.
 
-#ifndef DEBUG
-    // check path to executable in an obtuse way, prevent re-use of
-    // Mailspring-Sync in products / forks not called Mailspring.
-    transform(exectuablePath.begin(), exectuablePath.end(), exectuablePath.begin(), ::tolower);
-    string headerMessageId = string(USAGE_STRING).substr(59, 4) + string(USAGE_IDENTITY).substr(33, 6);
-    if (exectuablePath.find(headerMessageId) == string::npos) {
-        return 2;
-    }
-#endif
+    // ActunaMail (ticket 12c, 2026-05-10): the upstream anti-fork check
+    // that required the substring "mailspring" in the lowercased executable
+    // path is removed. It was meant to discourage forks of Mailspring-Sync,
+    // but ActunaMail is a legitimate GPL-3.0 §5 fork — modifications are
+    // published openly at https://github.com/WojRep/Mailspring-Sync. The
+    // check forced our build pipeline to relocate mailsync to
+    // app.asar.unpacked/mailspring/mailsync as a workaround; removing it
+    // lets the binary live at app.asar.unpacked/mailsync, free of the
+    // legacy path component.
 
     // initialize the stanford exception handler
     exceptions::setProgramNameForStackTrace(exectuablePath.c_str());
@@ -773,11 +789,49 @@ string exectuablePath = argv[0];
     
     // check required environment
     string eConfigDirPath = MailUtils::getEnvUTF8("CONFIG_DIR_PATH");
+    // WS2-F (Actuna Mail): IDENTITY_SERVER is intentionally allowed to be
+    // empty. The Electron parent process passes "" so no Foundry endpoint
+    // is reachable; CONFIG_DIR_PATH alone is required to start mailsync.
     string eIdentityServer = MailUtils::getEnvUTF8("IDENTITY_SERVER");
+    (void)eIdentityServer; // retained for diagnostic logging only
 
-    if ((eConfigDirPath == "") || (eIdentityServer == "")) {
+    if (eConfigDirPath == "") {
         option::printUsage(std::cout, usage);
         return 1;
+    }
+
+    // Ticket 45d HOTFIX (SQLCipher Tier A) — validate ACTUNA_DB_KEY.
+    //
+    // Post-amalgamation-swap (45d.2) edgehill.db is SQLCipher-encrypted.
+    // An empty key here would make MailStore open/create the database as
+    // PLAINTEXT — which the renderer (always keyed) then cannot read,
+    // causing a reset → archive → restart loop. So an empty key is now
+    // FATAL, not "permitted": refuse to start. The Electron parent
+    // (mailsync-process.ts) always passes the key obtained from
+    // KeyManager.getDBKey(); an empty value signals a real bug upstream
+    // and must fail loudly rather than silently degrade to plaintext.
+    //
+    // When non-empty, the key must be exactly 64 hex chars (= 32 bytes /
+    // 256 bits, SQLCipher v4 default). Malformed → refuse to start.
+    string eDbKey = MailUtils::getEnvUTF8("ACTUNA_DB_KEY");
+    if (eDbKey.empty()) {
+        std::cerr << "ACTUNA_DB_KEY is empty. ActunaMail v0.3+ stores edgehill.db "
+                     "encrypted (SQLCipher Tier A); mailsync cannot run without the "
+                     "database key. Refusing to start." << std::endl;
+        return 1;
+    }
+    if (eDbKey.length() != 64) {
+        std::cerr << "ACTUNA_DB_KEY: expected 64 hex chars (32 bytes), got "
+                  << eDbKey.length() << ". Refusing to start." << std::endl;
+        return 1;
+    }
+    for (char c : eDbKey) {
+        bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!ok) {
+            std::cerr << "ACTUNA_DB_KEY: contains non-hex character. Refusing to start."
+                      << std::endl;
+            return 1;
+        }
     }
 
     // initialize SQLite3 cache directory to the config dir path, ensuring we store
@@ -866,9 +920,10 @@ string exectuablePath = argv[0];
     try {
         if (logToFile) {
             // If we're attached to the mail client, log everything to a
-            // rotating log file with the default logger format.
+            // rotating log file. Ticket #04 04d: pino-compatible JSON-line
+            // format so C++ and Electron logs share one schema.
             // IMPORANT: On Windows, only one sync worker can have this file open at once.
-            spdlog::set_formatter(std::make_shared<SPDFormatterWithThreadNames>("%P %+"));
+            spdlog::set_formatter(std::make_shared<SPDJsonFormatter>());
     #if defined(_MSC_VER)
             wstring_convert<codecvt_utf8<wchar_t>, wchar_t> convert;
             wstring logPath = convert.from_bytes(eConfigDirPath) + convert.from_bytes(FS_PATH_SEP + "mailsync-" + account->id() + ".log");

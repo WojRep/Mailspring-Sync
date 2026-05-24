@@ -742,9 +742,23 @@ void SMTPSession::checkAccount(Address * from, ErrorCode * pError)
     }
 
     // build the MIME message
+    //
+    // ActunaMail v0.2.f: subject/body/from/user-agent are read from
+    // ACTUNA_TEST_* env vars passed by the renderer-side
+    // mailsync-process.ts. The renderer feeds those vars from the
+    // localized() i18n system, so the test message is delivered in the
+    // user's currently-selected app locale and contains the EU
+    // compliance summary (GDPR / AI Act / NIS2 / KNF Rec. D & Z).
+    // When the env vars are not set we fall back to the original
+    // upstream Mailspring strings so a stock mailsync still works.
+    auto envOr = [](const char* key, const char* fallback) -> String* {
+        const char* v = getenv(key);
+        return String::stringWithUTF8Characters((v && *v) ? v : fallback);
+    };
+
     MessageBuilder builder;
-    builder.header()->setSubject(MCSTR("Mailspring SMTP Test Email"));
-    builder.header()->setUserAgent(MCSTR("Mailspring"));
+    builder.header()->setSubject(envOr("ACTUNA_TEST_SUBJECT", "Mailspring SMTP Test Email"));
+    builder.header()->setUserAgent(envOr("ACTUNA_TEST_USER_AGENT", "Mailspring"));
     builder.header()->setDate(time(0));
 
     Address* me = Address::addressWithMailbox(from->mailbox());
@@ -757,8 +771,9 @@ void SMTPSession::checkAccount(Address * from, ErrorCode * pError)
     replyTo->addObject(me);
 
     builder.header()->setReplyTo(replyTo);
-    builder.header()->setFrom(Address::addressWithDisplayName(MCSTR("Mailspring Team"), from->mailbox()));
-    builder.setTextBody(MCSTR(
+    builder.header()->setFrom(Address::addressWithDisplayName(
+        envOr("ACTUNA_TEST_FROM_NAME", "Mailspring Team"), from->mailbox()));
+    builder.setTextBody(envOr("ACTUNA_TEST_BODY",
         "This is an email sent by Mailspring while we were testing your account config.\r\n\r\n"
         "As you've received it, everything must be a-ok.\r\n\r\n"
         "Kind regards,\r\nThe Mailspring Team\r\n\r\n"

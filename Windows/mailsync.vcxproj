@@ -92,6 +92,7 @@
     <ClCompile Include="..\MailSync\DAVUtils.cpp" />
     <ClCompile Include="..\MailSync\DAVWorker.cpp" />
     <ClCompile Include="..\MailSync\VCard.cpp" />
+    <ClCompile Include="..\MailSync\AttachmentCrypto.cpp" />
     <ClCompile Include="..\MailSync\DeltaStream.cpp" />
     <ClCompile Include="..\MailSync\GenericException.cpp" />
     <ClCompile Include="..\MailSync\GoogleContactsWorker.cpp" />

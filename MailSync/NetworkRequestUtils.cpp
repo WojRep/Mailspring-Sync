@@ -201,13 +201,42 @@ void ValidateRequestResp(CURLcode res, CURL * curl_handle, string resp) {
 }
 
 // Shorthand methods for Identity Server
+//
+// WS2-F (Actuna Mail): hard guard against any contact with Foundry's
+// identity server. The Electron parent process passes IDENTITY_SERVER=""
+// (per WS2-D in mailspring/app/src/mailsync-process.ts). Any code path
+// here that tries to construct an identity URL throws, so:
+//
+//   - /api/resolve-dav-hosts      (DAVWorker.cpp; was unguarded by Identity)
+//   - /api/feature_usage_event    (TaskProcessor.cpp; was Identity-only,
+//                                  but defense in depth)
+//   - /metadata/<accountId>/...   (MetadataWorker / TaskProcessor)
+//   - /deltas/<accountId>/...     (MetadataWorker streaming)
+//
+// all fail at request creation. See analysis/06-mailsync-cpp-audit.md
+// D1 for the endpoint catalog and D6 for the env var contract.
+//
+// Compliance: GDPR Art. 5(1)(c), 6, 44+; KNF Rec. Z; NIS2 Art. 21(c).
 
 CURL * CreateIdentityRequest(string path, string method, const char * payloadChars) {
-    string url { MailUtils::getEnvUTF8("IDENTITY_SERVER") + path };
+    string identityServer = MailUtils::getEnvUTF8("IDENTITY_SERVER");
+    if (identityServer.empty()) {
+        // Actuna Mail mode: Foundry identity server is intentionally
+        // unset. Refuse to construct an outbound HTTP request to anything.
+        throw SyncException(
+            "actuna-no-identity-server",
+            "IDENTITY_SERVER is empty; Foundry endpoints are disabled in Actuna Mail (path was: " + path + ")",
+            false /* not retryable */
+        );
+    }
+
+    string url { identityServer + path };
 
     if (Identity::GetGlobal() == nullptr) {
-        // Note: almost all the backend APIs require auth except for /api/resolve-dav-hosts
-        // and calls to this method should be avoided if no identity is present.
+        // Upstream comment retained for context: "almost all the backend
+        // APIs require auth except for /api/resolve-dav-hosts". In Actuna
+        // Mail this branch is unreachable because the empty-IDENTITY_SERVER
+        // guard above already threw.
         return CreateJSONRequest(url, method, "", payloadChars);
     }
 

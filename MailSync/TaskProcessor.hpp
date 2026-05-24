@@ -89,6 +89,7 @@ private:
     void performRemoteSyncbackMetadata(Task * task);
     
     void performRemoteDestroyCategory(Task * task);
+    void destroyFolderTreePermanently(string path, Array * remoteFolders);
     void performRemoteSendDraft(Task * task);
 
     void performRemoteSendFeatureUsageEvent(Task * task);

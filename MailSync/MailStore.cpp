@@ -78,8 +78,42 @@ bool MessageAttributesMatch(MessageAttributes a, MessageAttributes b) {
 
 #pragma mark MailStore
 
+// Ticket 45d HOTFIX — open edgehill.db and bind the SQLCipher key as the
+// VERY FIRST operation on the connection, before any prepared statement
+// touches a database page.
+//
+// Why a helper instead of keying in the constructor body: the MailStore
+// member-initializer list constructs `_db` and then immediately prepares
+// `_stmtBeginTransaction` ("BEGIN IMMEDIATE TRANSACTION") and the other
+// statement members. `sqlite3_prepare_v2` reads schema pages — which for
+// a SQLCipher connection REQUIRES the key to already be set. A PRAGMA key
+// in the constructor BODY runs after the initializer list, i.e. too late:
+// mailsync would initialise edgehill.db as a PLAINTEXT database, the
+// renderer (always keyed) would then fail to open it ("file is not a
+// database"), triggering reset → archive → restart loop.
+//
+// This helper guarantees: open → PRAGMA key → return (move). The keyed
+// Database is then moved into `_db`, so the statement members in the
+// initializer list prepare against an already-keyed connection.
+//
+// ACTUNA_DB_KEY is the hex-encoded 32-byte key from the Electron
+// parent (mailsync-process.ts, ticket 45c). main.cpp refuses to start
+// for DB-touching modes if it is empty/malformed, so by the time any
+// MailStore is constructed the key is present and well-formed.
+static SQLite::Database openEdgehillDatabase() {
+    string path = MailUtils::getEnvUTF8("CONFIG_DIR_PATH") + FS_PATH_SEP + "edgehill.db";
+    SQLite::Database db(path, SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);
+    string dbKeyHex = MailUtils::getEnvUTF8("ACTUNA_DB_KEY");
+    if (!dbKeyHex.empty()) {
+        // PRAGMA key is the SQLCipher keying operation — must precede any
+        // page read. Binds AES-256-CBC + HMAC page codec (sqlite3mc).
+        SQLite::Statement(db, "PRAGMA key = \"x'" + dbKeyHex + "'\"").executeStep();
+    }
+    return db;
+}
+
 MailStore::MailStore() :
-    _db(MailUtils::getEnvUTF8("CONFIG_DIR_PATH") + FS_PATH_SEP + "edgehill.db", SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE),
+    _db(openEdgehillDatabase()),
     _stmtBeginTransaction(_db, "BEGIN IMMEDIATE TRANSACTION"),
     _stmtRollbackTransaction(_db, "ROLLBACK"),
     _stmtCommitTransaction(_db, "COMMIT"),
@@ -88,10 +122,10 @@ MailStore::MailStore() :
     _labelCache()
 {
     _db.setBusyTimeout(10 * 1000);
-    
+
     // Note: These are properties of the connection, so they must be set regardless
     // of whether the database setup queries are run.
-    
+
     // https://www.sqlite.org/intern-v-extern-blob.html
     // A database page size of 8192 or 16384 gives the best performance for large BLOB I/O.
     SQLite::Statement(_db, "PRAGMA journal_mode = WAL").executeStep();

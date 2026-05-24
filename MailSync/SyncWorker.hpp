@@ -69,8 +69,6 @@ public:
     std::vector<std::shared_ptr<Folder>> syncFoldersAndLabels();
 
 private:
-    
-    void ensureRootMailspringFolder(vector<string> containerFolderComponents, Array * remoteFolders);
 
     bool initialSyncFolderIncremental(Folder & folder, IMAPFolderStatus & remoteStatus);
         
