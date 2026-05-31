@@ -37,6 +37,7 @@ Thread::Thread(string msgId, string accountId, string subject, uint64_t gThreadI
     // we'll update these below
     _data["unread"] = 0;
     _data["starred"] = 0;
+    _data["pinned"] = 0;
     _data["inAllMail"] = false;
     _data["attachmentCount"] = 0;
     _data["searchRowId"] = 0;
@@ -79,6 +80,15 @@ int Thread::starred() {
 
 void Thread::setStarred(int s) {
     _data["starred"] = s;
+}
+
+// Defensive read: legacy threads persisted before V10 lack "pinned" — default 0.
+int Thread::pinned() {
+    return _data.count("pinned") ? _data["pinned"].get<int>() : 0;
+}
+
+void Thread::setPinned(int s) {
+    _data["pinned"] = s;
 }
 
 int Thread::attachmentCount() {
@@ -157,6 +167,7 @@ string Thread::categoriesSearchString() {
 void Thread::resetCountedAttributes() {
     setUnread(0);
     setStarred(0);
+    setPinned(0);
     setAttachmentCount(0);
     _data["folders"] = json::array();
     _data["labels"] = json::array();
@@ -168,6 +179,7 @@ void Thread::applyMessageAttributeChanges(MessageSnapshot & old, Message * next,
     // decrement basic attributes
     setUnread(unread() - old.unread);
     setStarred(starred() - old.starred);
+    setPinned(pinned() - old.pinned);
     setAttachmentCount(attachmentCount() - (int)old.fileCount);
     
     // decrement folder refcounts. Iterate through the thread's folders
@@ -223,6 +235,7 @@ void Thread::applyMessageAttributeChanges(MessageSnapshot & old, Message * next,
         // increment basic attributes
         setUnread(unread() + next->isUnread());
         setStarred(starred() + next->isStarred());
+        setPinned(pinned() + next->isPinned());
         setAttachmentCount(attachmentCount() + (int)next->fileCountForThreadList());
 
         // increment dates
@@ -328,13 +341,14 @@ string Thread::tableName() {
 }
 
 vector<string> Thread::columnsForQuery() {
-    return vector<string>{"id", "data", "accountId", "version", "gThrId", "unread", "starred", "inAllMail", "subject", "lastMessageTimestamp", "lastMessageReceivedTimestamp", "lastMessageSentTimestamp", "firstMessageTimestamp", "hasAttachments"};
+    return vector<string>{"id", "data", "accountId", "version", "gThrId", "unread", "starred", "pinned", "inAllMail", "subject", "lastMessageTimestamp", "lastMessageReceivedTimestamp", "lastMessageSentTimestamp", "firstMessageTimestamp", "hasAttachments"};
 }
 
 void Thread::bindToQuery(SQLite::Statement * query) {
     MailModel::bindToQuery(query);
     query->bind(":unread", unread());
     query->bind(":starred", starred());
+    query->bind(":pinned", pinned());
     query->bind(":subject", subject());
     query->bind(":inAllMail", inAllMail());
     query->bind(":gThrId", gThrId());

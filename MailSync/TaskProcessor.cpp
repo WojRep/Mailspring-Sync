@@ -263,6 +263,31 @@ void _applyStarredInIMAPFolder(IMAPSession * session, String * path, IndexSet * 
     }
 }
 
+// Pin cross-device (decyzja plan_to_version_1.0/46). Kalka _applyStarred,
+// ale nośnikiem jest własny keyword IMAP `$Pinned` (nie wbudowana flaga).
+void _applyPinned(Message * msg, json & data) {
+    msg->setPinned(data["pinned"].get<bool>());
+}
+
+void _applyPinnedInIMAPFolder(IMAPSession * session, String * path, IndexSet * uids, vector<shared_ptr<Message>> messages, json & data) {
+    // Serwer musi pozwalać na własne keywordy (PERMANENTFLAGS `\*`). Jeśli nie —
+    // pin pozostaje lokalny (fallback), bez błędu i bez retry.
+    if (!session->allowsNewPermanentFlags()) {
+        return;
+    }
+    ErrorCode err = ErrorCode::ErrorNone;
+    Array * customFlags = Array::array();
+    customFlags->addObject(String::stringWithUTF8Characters("$Pinned"));
+    if (data["pinned"].get<bool>() == true) {
+        session->storeFlagsAndCustomFlagsByUID(path, uids, IMAPStoreFlagsRequestKindAdd, MessageFlagNone, customFlags, &err);
+    } else {
+        session->storeFlagsAndCustomFlagsByUID(path, uids, IMAPStoreFlagsRequestKindRemove, MessageFlagNone, customFlags, &err);
+    }
+    if (err != ErrorCode::ErrorNone) {
+        throw SyncException(err, "storeFlagsAndCustomFlagsByUID");
+    }
+}
+
 void _applyFolder(Message * msg, json & data) {
     Folder folder{data["folder"]};
     msg->setClientFolder(&folder);
@@ -422,6 +447,9 @@ void TaskProcessor::performLocal(Task * task) {
         } else if (cname == "ChangeStarredTask") {
             performLocalChangeOnMessages(task, _applyStarred);
 
+        } else if (cname == "ChangePinnedTask") {
+            performLocalChangeOnMessages(task, _applyPinned);
+
         } else if (cname == "ChangeFolderTask") {
             performLocalChangeOnMessages(task, _applyFolder);
             
@@ -521,7 +549,10 @@ void TaskProcessor::performRemote(Task * task) {
                 
             } else if (cname == "ChangeStarredTask") {
                 performRemoteChangeOnMessages(task, false, _applyStarredInIMAPFolder);
-                
+
+            } else if (cname == "ChangePinnedTask") {
+                performRemoteChangeOnMessages(task, false, _applyPinnedInIMAPFolder);
+
             } else if (cname == "ChangeFolderTask") {
                 performRemoteChangeOnMessages(task, true, _applyFolderMoveInIMAPFolder);
 
@@ -640,6 +671,7 @@ Message TaskProcessor::inflateClientDraftJSON(json & draftJSON, shared_ptr<Messa
             {"draft", true},
             {"unread", false},
             {"starred", false},
+            {"pinned", false},
             {"folder", folder->toJSON()},
             {"remoteFolder", folder->toJSON()},
             {"date", time(0)},

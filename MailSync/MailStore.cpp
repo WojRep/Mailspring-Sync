@@ -44,6 +44,20 @@ MessageAttributes MessageAttributesForMessage(IMAPMessage * msg) {
     m.uid = msg->uid();
     m.unread = bool(!(msg->flags() & MessageFlagSeen));
     m.starred = bool(msg->flags() & MessageFlagFlagged);
+
+    // Pin cross-device (decyzja plan_to_version_1.0/46): IMAP keyword `$Pinned`.
+    // mailcore2 parsuje niestandardowe keywordy do customFlags() przy FETCH FLAGS.
+    m.pinned = false;
+    Array * customFlags = msg->customFlags();
+    if (customFlags != nullptr) {
+        for (unsigned int ci = 0; ci < customFlags->count(); ci ++) {
+            if (string(((String *)customFlags->objectAtIndex(ci))->UTF8Characters()) == "$Pinned") {
+                m.pinned = true;
+                break;
+            }
+        }
+    }
+
     m.labels = std::vector<std::string>{};
     
     Array * labels = msg->gmailLabels();
@@ -72,7 +86,7 @@ MessageAttributes MessageAttributesForMessage(IMAPMessage * msg) {
 }
 
 bool MessageAttributesMatch(MessageAttributes a, MessageAttributes b) {
-    return a.unread == b.unread && a.starred == b.starred && a.uid == b.uid && a.labels == b.labels;
+    return a.unread == b.unread && a.starred == b.starred && a.pinned == b.pinned && a.uid == b.uid && a.labels == b.labels;
 }
 
 
@@ -134,7 +148,7 @@ MailStore::MailStore() :
     SQLite::Statement(_db, "PRAGMA main.synchronous = NORMAL").exec();
 }
 
-static int CURRENT_VERSION = 9;
+static int CURRENT_VERSION = 10;
 static string VACUUM_TIME_KEY = "VACUUM_TIME";
 static time_t VACUUM_INTERVAL = 14 * 24 * 60 * 60; // 14 days
 
@@ -186,6 +200,11 @@ void MailStore::migrate() {
     }
     if (version < 9) {
         for (string sql : V9_SETUP_QUERIES) {
+            SQLite::Statement(_db, sql).exec();
+        }
+    }
+    if (version < 10) {
+        for (string sql : V10_SETUP_QUERIES) {
             SQLite::Statement(_db, sql).exec();
         }
     }

@@ -221,6 +221,15 @@ static vector<string> V9_SETUP_QUERIES = {
     "CREATE INDEX IF NOT EXISTS EventRecurrenceId ON Event(calendarId, icsuid, recurrenceId)",
 };
 
+// V10: Pin cross-device (decyzja plan_to_version_1.0/46) — kolumna `pinned`
+// (znacznik IMAP `$Pinned`) na Message i Thread + indeksy "pinned top of inbox".
+static vector<string> V10_SETUP_QUERIES = {
+    "ALTER TABLE `Message` ADD COLUMN pinned TINYINT(1) DEFAULT 0",
+    "ALTER TABLE `Thread` ADD COLUMN pinned INTEGER DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS ThreadPinnedIndex ON `Thread` (accountId, lastMessageReceivedTimestamp DESC) WHERE pinned = 1 AND inAllMail = 1",
+    "CREATE INDEX IF NOT EXISTS ThreadUnifiedPinnedIndex ON `Thread` (lastMessageReceivedTimestamp DESC) WHERE pinned = 1 AND inAllMail = 1",
+};
+
 static map<string, string> COMMON_FOLDER_NAMES = {
     {"gel\xc3\xb6scht", "trash"},
     {"papierkorb", "trash"},
