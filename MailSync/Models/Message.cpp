@@ -47,6 +47,7 @@ shared_ptr<Message> Message::messageWithDeletionPlaceholderFor(shared_ptr<Messag
     stub->setDraft(false);
     stub->setUnread(false);
     stub->setStarred(false);
+    stub->setPinned(false);
     stub->setRemoteXGMLabels(nolabels);
     stub->setSyncUnsavedChanges(1);
     stub->setSyncedAt(time(0) + 1 * 60 * 60);
@@ -83,6 +84,7 @@ MailModel(MailUtils::idForMessage(folder.accountId(), folder.path(), msg), folde
     MessageAttributes attrs = MessageAttributesForMessage(msg);
     _data["unread"] = attrs.unread;
     _data["starred"] = attrs.starred;
+    _data["pinned"] = attrs.pinned;
     _data["labels"] = attrs.labels;
     _data["draft"] = attrs.draft;
     if (folder.role() == "drafts") {
@@ -148,6 +150,7 @@ MessageSnapshot Message::getSnapshot() {
     MessageSnapshot s;
     s.unread = isUnread();
     s.starred = isStarred();
+    s.pinned = isPinned();
     s.inAllMail = inAllMail();
     s.fileCount = fileCountForThreadList();
     s.remoteXGMLabels = remoteXGMLabels();
@@ -200,6 +203,16 @@ bool Message::isStarred() {
 
 void Message::setStarred(bool s) {
     _data["starred"] = s;
+}
+
+// Defensive read: legacy messages persisted before V10 lack "pinned" in their
+// JSON blob — default to false instead of throwing.
+bool Message::isPinned() {
+    return _data.count("pinned") ? _data["pinned"].get<bool>() : false;
+}
+
+void Message::setPinned(bool p) {
+    _data["pinned"] = p;
 }
 
 json & Message::remoteXGMLabels() {
@@ -428,7 +441,7 @@ string Message::tableName() {
 }
 
 vector<string> Message::columnsForQuery() {
-    return vector<string>{"id", "data", "accountId", "version", "headerMessageId", "subject", "gMsgId", "date", "draft", "unread", "starred", "remoteUID", "remoteXGMLabels", "remoteFolderId", "threadId"};
+    return vector<string>{"id", "data", "accountId", "version", "headerMessageId", "subject", "gMsgId", "date", "draft", "unread", "starred", "pinned", "remoteUID", "remoteXGMLabels", "remoteFolderId", "threadId"};
 }
 
 void Message::bindToQuery(SQLite::Statement * query) {
@@ -436,6 +449,7 @@ void Message::bindToQuery(SQLite::Statement * query) {
     query->bind(":date", (double)date());
     query->bind(":unread", isUnread());
     query->bind(":starred", isStarred());
+    query->bind(":pinned", isPinned());
     query->bind(":draft", isDraft());
     query->bind(":headerMessageId", headerMessageId());
     query->bind(":subject", subject());

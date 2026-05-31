@@ -49,6 +49,8 @@ public:
     void setUnread(int u);
     int starred();
     void setStarred(int s);
+    int pinned();
+    void setPinned(int s);
     int attachmentCount();
     void setAttachmentCount(int s);
     

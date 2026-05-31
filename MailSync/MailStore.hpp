@@ -45,6 +45,7 @@ struct MessageAttributes {
     uint32_t uid;
     bool unread;
     bool starred;
+    bool pinned;
     bool draft;
     vector<string> labels;
 };

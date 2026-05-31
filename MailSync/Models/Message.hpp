@@ -35,13 +35,14 @@ class Message;
 struct MessageSnapshot {
     bool unread;
     bool starred;
+    bool pinned;
     bool inAllMail;
     size_t fileCount;
     json remoteXGMLabels;
     string clientFolderId;
 };
 
-static MessageSnapshot MessageEmptySnapshot = MessageSnapshot{false, false, false, 0, nullptr, ""};
+static MessageSnapshot MessageEmptySnapshot = MessageSnapshot{false, false, false, false, 0, nullptr, ""};
 
 // Message
 
@@ -75,7 +76,10 @@ public:
 
     bool isStarred();
     void setStarred(bool s);
-    
+
+    bool isPinned();
+    void setPinned(bool p);
+
     string threadId();
     void setThreadId(string threadId);
 
