@@ -244,6 +244,19 @@ void MailProcessor::updateMessage(Message * local, IMAPMessage * remote, Folder 
         logger->info("-- Starred ({} to {})", local->isDraft(), updated.draft);
         noChanges = false;
     }
+    // Pin + tagi (bilet #117, fix inbound #46): bez tych diffów zmiany keywordów
+    // z innego urządzenia nigdy nie były persystowane lokalnie.
+    if (updated.pinned != local->isPinned()) {
+        if (noChanges) logger->info("- Updating message {}", local->id());
+        logger->info("-- Pinned ({} to {})", local->isPinned(), updated.pinned);
+        noChanges = false;
+    }
+    json jCustomKeywords = json(updated.customKeywords);
+    if (jCustomKeywords != local->customKeywords()) {
+        if (noChanges) logger->info("- Updating message {}", local->id());
+        logger->info("-- CustomKeywords ({} to {})", local->customKeywords().dump(), jCustomKeywords.dump());
+        noChanges = false;
+    }
     if (updated.uid != local->remoteUID()) {
         if (noChanges) logger->info("- Updating message {}", local->id());
         logger->info("-- UID ({} to {})", local->remoteUID(), updated.uid);
@@ -269,6 +282,8 @@ void MailProcessor::updateMessage(Message * local, IMAPMessage * remote, Folder 
     
         local->setUnread(updated.unread);
         local->setStarred(updated.starred);
+        local->setPinned(updated.pinned);
+        local->setCustomKeywords(jCustomKeywords);
         local->setDraft(updated.draft);
         local->setRemoteUID(updated.uid);
         local->setRemoteFolder(&folder);

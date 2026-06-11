@@ -85,6 +85,7 @@ MailModel(MailUtils::idForMessage(folder.accountId(), folder.path(), msg), folde
     _data["unread"] = attrs.unread;
     _data["starred"] = attrs.starred;
     _data["pinned"] = attrs.pinned;
+    _data["customKeywords"] = attrs.customKeywords;
     _data["labels"] = attrs.labels;
     _data["draft"] = attrs.draft;
     if (folder.role() == "drafts") {
@@ -151,6 +152,7 @@ MessageSnapshot Message::getSnapshot() {
     s.unread = isUnread();
     s.starred = isStarred();
     s.pinned = isPinned();
+    s.customKeywords = customKeywords();
     s.inAllMail = inAllMail();
     s.fileCount = fileCountForThreadList();
     s.remoteXGMLabels = remoteXGMLabels();
@@ -213,6 +215,18 @@ bool Message::isPinned() {
 
 void Message::setPinned(bool p) {
     _data["pinned"] = p;
+}
+
+// Tag sync cross-device (bilet #117). Defensive read jak pinned —
+// wiadomości sprzed wersji z tagami nie mają "customKeywords" w blobie.
+json Message::customKeywords() {
+    return (_data.count("customKeywords") && _data["customKeywords"].is_array())
+        ? _data["customKeywords"]
+        : json::array();
+}
+
+void Message::setCustomKeywords(json kws) {
+    _data["customKeywords"] = kws.is_array() ? kws : json::array();
 }
 
 json & Message::remoteXGMLabels() {

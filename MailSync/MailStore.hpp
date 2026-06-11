@@ -48,6 +48,9 @@ struct MessageAttributes {
     bool pinned;
     bool draft;
     vector<string> labels;
+    // Tag sync cross-device (bilet #117): niestandardowe keywordy IMAP poza
+    // `$Pinned` (ten ma własne pole). Posortowane — stabilne porównania.
+    vector<string> customKeywords;
 };
 
 MessageAttributes MessageAttributesForMessage(mailcore::IMAPMessage * msg);

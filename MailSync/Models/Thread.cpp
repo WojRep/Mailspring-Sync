@@ -38,6 +38,9 @@ Thread::Thread(string msgId, string accountId, string subject, uint64_t gThreadI
     _data["unread"] = 0;
     _data["starred"] = 0;
     _data["pinned"] = 0;
+    // Tag sync (bilet #117): refcounty keywordów per thread + derywowana unia.
+    _data["ckwRefs"] = json::object();
+    _data["customKeywords"] = json::array();
     _data["inAllMail"] = false;
     _data["attachmentCount"] = 0;
     _data["searchRowId"] = 0;
@@ -169,6 +172,8 @@ void Thread::resetCountedAttributes() {
     setStarred(0);
     setPinned(0);
     setAttachmentCount(0);
+    _data["ckwRefs"] = json::object();
+    _data["customKeywords"] = json::array();
     _data["folders"] = json::array();
     _data["labels"] = json::array();
 
@@ -181,6 +186,35 @@ void Thread::applyMessageAttributeChanges(MessageSnapshot & old, Message * next,
     setStarred(starred() - old.starred);
     setPinned(pinned() - old.pinned);
     setAttachmentCount(attachmentCount() - (int)old.fileCount);
+
+    // Tag sync (bilet #117): rollup keywordów = unia keywordów wiadomości wątku,
+    // utrzymywana refcountami (wzorzec folder/label _refs). Defensive: wątki
+    // sprzed wersji z tagami nie mają "ckwRefs".
+    {
+        json refs = (_data.count("ckwRefs") && _data["ckwRefs"].is_object())
+            ? _data["ckwRefs"] : json::object();
+        if (old.customKeywords.is_array()) {
+            for (auto & kw : old.customKeywords) {
+                string k = kw.get<string>();
+                if (refs.count(k)) {
+                    int r = refs[k].get<int>() - 1;
+                    if (r > 0) { refs[k] = r; } else { refs.erase(k); }
+                }
+            }
+        }
+        if (next) {
+            for (auto & kw : next->customKeywords()) {
+                string k = kw.get<string>();
+                refs[k] = (refs.count(k) ? refs[k].get<int>() : 0) + 1;
+            }
+        }
+        _data["ckwRefs"] = refs;
+        json arr = json::array();
+        for (auto it = refs.begin(); it != refs.end(); ++it) {
+            arr.push_back(it.key());
+        }
+        _data["customKeywords"] = arr;
+    }
     
     // decrement folder refcounts. Iterate through the thread's folders
     // and build a new set containing every folder that still has a

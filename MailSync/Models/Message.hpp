@@ -40,9 +40,11 @@ struct MessageSnapshot {
     size_t fileCount;
     json remoteXGMLabels;
     string clientFolderId;
+    // Tag sync cross-device (bilet #117): keywordy IMAP wiadomości (poza $Pinned).
+    json customKeywords;
 };
 
-static MessageSnapshot MessageEmptySnapshot = MessageSnapshot{false, false, false, false, 0, nullptr, ""};
+static MessageSnapshot MessageEmptySnapshot = MessageSnapshot{false, false, false, false, 0, nullptr, "", json::array()};
 
 // Message
 
@@ -79,6 +81,9 @@ public:
 
     bool isPinned();
     void setPinned(bool p);
+
+    json customKeywords();
+    void setCustomKeywords(json kws);
 
     string threadId();
     void setThreadId(string threadId);

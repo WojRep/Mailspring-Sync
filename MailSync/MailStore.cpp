@@ -46,16 +46,22 @@ MessageAttributes MessageAttributesForMessage(IMAPMessage * msg) {
     m.starred = bool(msg->flags() & MessageFlagFlagged);
 
     // Pin cross-device (decyzja plan_to_version_1.0/46): IMAP keyword `$Pinned`.
+    // Tag sync cross-device (bilet #117): pozostałe niestandardowe keywordy
+    // trafiają do customKeywords (tagi — jak w Thunderbirdzie).
     // mailcore2 parsuje niestandardowe keywordy do customFlags() przy FETCH FLAGS.
     m.pinned = false;
+    m.customKeywords = std::vector<std::string>{};
     Array * customFlags = msg->customFlags();
     if (customFlags != nullptr) {
         for (unsigned int ci = 0; ci < customFlags->count(); ci ++) {
-            if (string(((String *)customFlags->objectAtIndex(ci))->UTF8Characters()) == "$Pinned") {
+            string kw = string(((String *)customFlags->objectAtIndex(ci))->UTF8Characters());
+            if (kw == "$Pinned") {
                 m.pinned = true;
-                break;
+            } else {
+                m.customKeywords.push_back(kw);
             }
         }
+        sort(m.customKeywords.begin(), m.customKeywords.end());
     }
 
     m.labels = std::vector<std::string>{};
@@ -86,7 +92,7 @@ MessageAttributes MessageAttributesForMessage(IMAPMessage * msg) {
 }
 
 bool MessageAttributesMatch(MessageAttributes a, MessageAttributes b) {
-    return a.unread == b.unread && a.starred == b.starred && a.pinned == b.pinned && a.uid == b.uid && a.labels == b.labels;
+    return a.unread == b.unread && a.starred == b.starred && a.pinned == b.pinned && a.uid == b.uid && a.labels == b.labels && a.customKeywords == b.customKeywords;
 }
 
 
@@ -276,7 +282,10 @@ SQLite::Database & MailStore::db()
 
 map<uint32_t, MessageAttributes> MailStore::fetchMessagesAttributesInRange(Range range, Folder & folder) {
     assertCorrectThread();
-    SQLite::Statement query(this->_db, "SELECT id, unread, starred, remoteUID, remoteXGMLabels FROM Message WHERE accountId = ? AND remoteFolderId = ? AND remoteUID >= ? AND remoteUID <= ?");
+    // Bilet #117 (+fix pin inbound): SELECT obejmuje też `pinned` i `data`
+    // (customKeywords w blobie JSON) — bez nich lokalne atrybuty zawsze różnią
+    // się od zdalnych keywordów i updateMessage nigdy ich nie persystuje.
+    SQLite::Statement query(this->_db, "SELECT id, unread, starred, pinned, data, remoteUID, remoteXGMLabels FROM Message WHERE accountId = ? AND remoteFolderId = ? AND remoteUID >= ? AND remoteUID <= ?");
     query.bind(1, folder.accountId());
     query.bind(2, folder.id());
     query.bind(3, (long long)(range.location));
@@ -303,12 +312,26 @@ map<uint32_t, MessageAttributes> MailStore::fetchMessagesAttributesInRange(Range
         attrs.uid = uid;
         attrs.starred = query.getColumn("starred").getInt() != 0;
         attrs.unread = query.getColumn("unread").getInt() != 0;
-        
+        attrs.pinned = query.getColumn("pinned").getInt() != 0;
+
         vector<string> labels{};
         for (const auto i : json::parse(query.getColumn("remoteXGMLabels").getString())) {
             labels.push_back(i.get<string>());
         }
         attrs.labels = labels;
+
+        attrs.customKeywords = std::vector<std::string>{};
+        try {
+            json data = json::parse(query.getColumn("data").getString());
+            if (data.count("customKeywords") && data["customKeywords"].is_array()) {
+                for (const auto & kw : data["customKeywords"]) {
+                    attrs.customKeywords.push_back(kw.get<string>());
+                }
+                sort(attrs.customKeywords.begin(), attrs.customKeywords.end());
+            }
+        } catch (...) {
+            // corrupted / legacy row — treat as no keywords
+        }
 
         results[uid] = attrs;
     }
