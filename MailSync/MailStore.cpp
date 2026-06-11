@@ -98,7 +98,7 @@ bool MessageAttributesMatch(MessageAttributes a, MessageAttributes b) {
 
 #pragma mark MailStore
 
-// Ticket 45d HOTFIX — open edgehill.db and bind the SQLCipher key as the
+// Ticket 45d HOTFIX — open actunamail.db and bind the SQLCipher key as the
 // VERY FIRST operation on the connection, before any prepared statement
 // touches a database page.
 //
@@ -108,7 +108,7 @@ bool MessageAttributesMatch(MessageAttributes a, MessageAttributes b) {
 // statement members. `sqlite3_prepare_v2` reads schema pages — which for
 // a SQLCipher connection REQUIRES the key to already be set. A PRAGMA key
 // in the constructor BODY runs after the initializer list, i.e. too late:
-// mailsync would initialise edgehill.db as a PLAINTEXT database, the
+// mailsync would initialise actunamail.db as a PLAINTEXT database, the
 // renderer (always keyed) would then fail to open it ("file is not a
 // database"), triggering reset → archive → restart loop.
 //
@@ -121,7 +121,7 @@ bool MessageAttributesMatch(MessageAttributes a, MessageAttributes b) {
 // for DB-touching modes if it is empty/malformed, so by the time any
 // MailStore is constructed the key is present and well-formed.
 static SQLite::Database openEdgehillDatabase() {
-    string path = MailUtils::getEnvUTF8("CONFIG_DIR_PATH") + FS_PATH_SEP + "edgehill.db";
+    string path = MailUtils::getEnvUTF8("CONFIG_DIR_PATH") + FS_PATH_SEP + "actunamail.db";
     SQLite::Database db(path, SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);
     string dbKeyHex = MailUtils::getEnvUTF8("ACTUNA_DB_KEY");
     if (!dbKeyHex.empty()) {
