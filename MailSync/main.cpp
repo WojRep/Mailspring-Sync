@@ -802,7 +802,7 @@ string exectuablePath = argv[0];
 
     // Ticket 45d HOTFIX (SQLCipher Tier A) — validate ACTUNA_DB_KEY.
     //
-    // Post-amalgamation-swap (45d.2) edgehill.db is SQLCipher-encrypted.
+    // Post-amalgamation-swap (45d.2) actunamail.db is SQLCipher-encrypted.
     // An empty key here would make MailStore open/create the database as
     // PLAINTEXT — which the renderer (always keyed) then cannot read,
     // causing a reset → archive → restart loop. So an empty key is now
@@ -815,7 +815,7 @@ string exectuablePath = argv[0];
     // 256 bits, SQLCipher v4 default). Malformed → refuse to start.
     string eDbKey = MailUtils::getEnvUTF8("ACTUNA_DB_KEY");
     if (eDbKey.empty()) {
-        std::cerr << "ACTUNA_DB_KEY is empty. ActunaMail v0.3+ stores edgehill.db "
+        std::cerr << "ACTUNA_DB_KEY is empty. ActunaMail v0.3+ stores actunamail.db "
                      "encrypted (SQLCipher Tier A); mailsync cannot run without the "
                      "database key. Refusing to start." << std::endl;
         return 1;
