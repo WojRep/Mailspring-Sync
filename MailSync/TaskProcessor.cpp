@@ -288,6 +288,70 @@ void _applyPinnedInIMAPFolder(IMAPSession * session, String * path, IndexSet * u
     }
 }
 
+// Tag sync cross-device (bilet #117). Kalka _applyPinned (transport) +
+// _applyLabels (multi-value toAdd/toRemove). Nośnik: własne keywordy IMAP —
+// te same, których Thunderbird używa na tagi; Exchange mapuje je na kategorie.
+void _applyKeywords(Message * msg, json & data) {
+    json kws = msg->customKeywords();
+    for (auto & item : data["keywordsToAdd"]) {
+        string kw = item.get<string>();
+        bool found = false;
+        for (auto & existing : kws) {
+            if (existing.get<string>() == kw) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            kws.push_back(kw);
+        }
+    }
+    for (auto & item : data["keywordsToRemove"]) {
+        string kw = item.get<string>();
+        for (int i = (int)kws.size() - 1; i >= 0; i --) {
+            if (kws.at(i).get<string>() == kw) {
+                kws.erase(i);
+            }
+        }
+    }
+    msg->setCustomKeywords(kws);
+}
+
+void _applyKeywordsInIMAPFolder(IMAPSession * session, String * path, IndexSet * uids, vector<shared_ptr<Message>> messages, json & data) {
+    // Serwer musi pozwalać na własne keywordy (PERMANENTFLAGS `\*`). Jeśli nie —
+    // tagi pozostają lokalne (fallback), bez błędu i bez retry — jak `$Pinned`.
+    if (!session->allowsNewPermanentFlags()) {
+        return;
+    }
+    AutoreleasePool pool;
+    ErrorCode err = ErrorCode::ErrorNone;
+
+    Array * toAdd = new mailcore::Array{};
+    toAdd->autorelease();
+    for (auto & item : data["keywordsToAdd"]) {
+        toAdd->addObject(AS_MCSTR(item.get<string>()));
+    }
+
+    Array * toRemove = new mailcore::Array{};
+    toRemove->autorelease();
+    for (auto & item : data["keywordsToRemove"]) {
+        toRemove->addObject(AS_MCSTR(item.get<string>()));
+    }
+
+    if (toAdd->count() > 0) {
+        session->storeFlagsAndCustomFlagsByUID(path, uids, IMAPStoreFlagsRequestKindAdd, MessageFlagNone, toAdd, &err);
+        if (err != ErrorCode::ErrorNone) {
+            throw SyncException(err, "storeFlagsAndCustomFlagsByUID - add");
+        }
+    }
+    if (toRemove->count() > 0) {
+        session->storeFlagsAndCustomFlagsByUID(path, uids, IMAPStoreFlagsRequestKindRemove, MessageFlagNone, toRemove, &err);
+        if (err != ErrorCode::ErrorNone) {
+            throw SyncException(err, "storeFlagsAndCustomFlagsByUID - remove");
+        }
+    }
+}
+
 void _applyFolder(Message * msg, json & data) {
     Folder folder{data["folder"]};
     msg->setClientFolder(&folder);
@@ -450,6 +514,9 @@ void TaskProcessor::performLocal(Task * task) {
         } else if (cname == "ChangePinnedTask") {
             performLocalChangeOnMessages(task, _applyPinned);
 
+        } else if (cname == "ChangeKeywordsTask") {
+            performLocalChangeOnMessages(task, _applyKeywords);
+
         } else if (cname == "ChangeFolderTask") {
             performLocalChangeOnMessages(task, _applyFolder);
             
@@ -552,6 +619,9 @@ void TaskProcessor::performRemote(Task * task) {
 
             } else if (cname == "ChangePinnedTask") {
                 performRemoteChangeOnMessages(task, false, _applyPinnedInIMAPFolder);
+
+            } else if (cname == "ChangeKeywordsTask") {
+                performRemoteChangeOnMessages(task, false, _applyKeywordsInIMAPFolder);
 
             } else if (cname == "ChangeFolderTask") {
                 performRemoteChangeOnMessages(task, true, _applyFolderMoveInIMAPFolder);
