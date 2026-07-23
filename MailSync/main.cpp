@@ -221,6 +221,15 @@ void runBackgroundSyncWorker() {
                 SharedDeltaStream()->beginConnectionError(bgWorker->account->id());
             }
             spdlog::get("logger")->info("--sleeping");
+        } catch (std::exception & ex) {
+            // Global backstop: an unexpected std::exception (e.g. a json type error
+            // from malformed/partial persisted data) must NOT abort() and crash-loop
+            // the account. Log it and treat it as retryable — fall through to the
+            // sleep below and try again on the next pass. The per-folder guard in
+            // SyncWorker::syncNow() already contains most such errors; this catches
+            // anything that escapes it (e.g. from syncFoldersAndLabels()).
+            exceptions::logCurrentExceptionWithStackTrace();
+            spdlog::get("logger")->error("Background sync hit an unexpected error, will retry: {}", ex.what());
         } catch (...) {
             exceptions::logCurrentExceptionWithStackTrace();
             abort();

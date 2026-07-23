@@ -51,6 +51,32 @@ using namespace mailcore;
 using namespace std;
 
 
+// Null-/type-safe read of a numeric field from a folder's persisted `localStatus`
+// JSON. That status is stored JSON that can — through a partial write, an aborted
+// sync or older data versions — hold a `null` (or be missing) where a number is
+// expected. A raw `status[key].get<T>()` then throws nlohmann::json::type_error.302
+// ("type must be number, but is null"), which used to escape the sync worker and
+// crash-loop the whole account (abort() + respawn). This returns `fallback` for
+// anything that is not a number, so sync can proceed and self-heal the field on the
+// next write. Used everywhere a numeric folder-status field is read.
+template <typename T>
+static T lsNumberOr(const json & status, const char * key, T fallback) {
+    auto it = status.find(key);
+    if (it != status.end() && it->is_number()) {
+        return it->get<T>();
+    }
+    return fallback;
+}
+
+// Whether `status[key]` exists AND holds a number. Used to detect a partial /
+// corrupted folder status (a null or missing numeric field) so it can be
+// re-initialized to a consistent state instead of throwing deeper in sync.
+static bool lsIsNumber(const json & status, const char * key) {
+    auto it = status.find(key);
+    return it != status.end() && it->is_number();
+}
+
+
 SyncWorker::SyncWorker(shared_ptr<Account> account) :
     store(new MailStore()),
     account(account),
@@ -320,6 +346,12 @@ bool SyncWorker::syncNow()
     });
     
     for (auto & folder : folders) {
+      // Per-folder resilience (global safeguard): a single folder with malformed or
+      // partial persisted status/data must never crash the whole account sync. Any
+      // std::exception raised while processing this folder — including json type
+      // errors like "type must be number, but is null" — is logged and we skip to
+      // the next folder (the failed one is retried on the next pass).
+      try {
         json & localStatus = folder->localStatus();
         json initialLocalStatus = localStatus; // note: json not json&
         
@@ -334,7 +366,16 @@ bool SyncWorker::syncNow()
         }
         
         // Step 1: Check folder UIDValidity
-        if (localStatus.empty() || localStatus[LS_UIDVALIDITY].is_null()) {
+        // (Re)initialize the folder status when it is empty OR when any essential
+        // numeric field is missing/null. A partially-written status (a null where a
+        // number is expected) would otherwise throw json::type_error.302 deeper in
+        // sync; re-initializing heals it to a consistent numeric state so the folder
+        // syncs instead of being permanently skipped by the per-folder guard.
+        if (localStatus.empty()
+            || !lsIsNumber(localStatus, LS_UIDVALIDITY)
+            || !lsIsNumber(localStatus, LS_SYNCED_MIN_UID)
+            || !lsIsNumber(localStatus, LS_UIDNEXT)
+            || !lsIsNumber(localStatus, LS_HIGHESTMODSEQ)) {
             // We're about to fetch the top N UIDs in the folder and start working backwards in time.
             // When we eventually finish and start using CONDSTORE, this will be the highestmodseq
             // from the /oldest/ synced block of UIDs, ensuring we see changes.
@@ -401,7 +442,7 @@ bool SyncWorker::syncNow()
         }
         
         // Step 2: Initial sync. Until we reach UID 1, we grab chunks of messages
-        uint32_t syncedMinUID = localStatus[LS_SYNCED_MIN_UID].get<uint32_t>();
+        uint32_t syncedMinUID = lsNumberOr<uint32_t>(localStatus, LS_SYNCED_MIN_UID, 1);
         uint32_t chunkSize = firstChunk ? 750 : 5000;
 
         if (syncedMinUID > 1) {
@@ -427,10 +468,10 @@ bool SyncWorker::syncNow()
             syncFolderChangesViaCondstore(*folder, remoteStatus, true);
         } else {
             uint32_t remoteUidnext = remoteStatus.uidNext();
-            uint32_t localUidnext = localStatus[LS_UIDNEXT].get<uint32_t>();
+            uint32_t localUidnext = lsNumberOr<uint32_t>(localStatus, LS_UIDNEXT, 0);
             bool newMessages = remoteUidnext > localUidnext;
-            bool timeForDeepScan = (iterationsSinceLaunch > 0) && (time(0) - localStatus[LS_LAST_DEEP].get<time_t>() > DEEP_SCAN_INTERVAL);
-            bool timeForShallowScan = !timeForDeepScan && (time(0) - localStatus[LS_LAST_SHALLOW].get<time_t>() > SHALLOW_SCAN_INTERVAL);
+            bool timeForDeepScan = (iterationsSinceLaunch > 0) && (time(0) - lsNumberOr<time_t>(localStatus, LS_LAST_DEEP, 0) > DEEP_SCAN_INTERVAL);
+            bool timeForShallowScan = !timeForDeepScan && (time(0) - lsNumberOr<time_t>(localStatus, LS_LAST_SHALLOW, 0) > SHALLOW_SCAN_INTERVAL);
 
             // Okay. If there are new messages in the folder (UIDnext has increased), do a heavy fetch of
             // those /AND/ get the bodies. This ensures people see both very quickly, which is important.
@@ -509,6 +550,10 @@ bool SyncWorker::syncNow()
         // Save the folder - note that helper methods above mutated localStatus.
         // Avoid the save if we can, because this creates a lot of noise in the client.
         store->saveFolderStatus(folder.get(), initialLocalStatus);
+      } catch (std::exception & ex) {
+        logger->error("SyncNow: skipping folder {} due to unexpected error: {}", folder->path(), ex.what());
+        continue;
+      }
     }
     
     // We've just unlinked a bunch of messages with PHASE A, now we'll delete the ones
@@ -819,8 +864,13 @@ void SyncWorker::syncFolderChangesViaCondstore(Folder & folder, IMAPFolderStatus
     // allocated mailcore objects freed when `pool` is removed from the stack
     AutoreleasePool pool;
 
-    uint32_t uidnext = folder.localStatus()[LS_UIDNEXT].get<uint32_t>();
-    uint64_t modseq = folder.localStatus()[LS_HIGHESTMODSEQ].get<uint64_t>();
+    // Null-/type-safe: this folder's persisted status can carry a null where a
+    // number is expected (partial write / legacy data). A raw .get<> here is what
+    // previously threw json::type_error.302 and crash-looped the account. Fall back
+    // to 0 and let the values self-heal — they are written back as the remote
+    // uidnext/modseq at the end of this function (LS_UIDNEXT/LS_HIGHESTMODSEQ below).
+    uint32_t uidnext = lsNumberOr<uint32_t>(folder.localStatus(), LS_UIDNEXT, 0);
+    uint64_t modseq = lsNumberOr<uint64_t>(folder.localStatus(), LS_HIGHESTMODSEQ, 0);
     uint64_t remoteModseq = remoteStatus.highestModSeqValue();
     uint32_t remoteUIDNext = remoteStatus.uidNext();
     time_t syncDataTimestamp = time(0);
