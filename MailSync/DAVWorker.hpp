@@ -72,6 +72,15 @@ public:
     shared_ptr<ContactBook> resolveAddressBook();
     string resolveCalendarHomeURL();
 
+    // #267: kandydaci na host CalDAV, w kolejności prób — jawne ustawienie
+    // konta, domena adresu e-mail (RFC 6764), host IMAP. Bez usług trzecich:
+    // odpytujemy wyłącznie serwer użytkownika.
+    vector<string> calendarHostCandidates();
+    // Pełny łańcuch discovery na JEDNYM hoście: .well-known/caldav →
+    // current-user-principal (RFC 5397) → calendar-home-set (RFC 4791 §6.2.1).
+    // Zwraca URL home-setu albo "" gdy host nie obsługuje CalDAV.
+    string discoverCalendarHomeAt(const string & caldavHost);
+
     // Returns the full https:// URL for a calendar collection path.
     // For Gmail, prepends calHost. For all other accounts, resolves
     // against the discovered cachedCalendarHomeURL.
@@ -89,6 +98,11 @@ public:
     void rebuildContactGroup(shared_ptr<Contact> contact);
 
     void runCalendars();
+    // #269: kalendarze wskazane ręcznie (settings.caldav_extra_urls). Osobna
+    // ścieżka, bo uruchamiana ZANIM discovery home-setu — jawny adres podaje się
+    // właśnie wtedy, gdy discovery nic nie znajduje i runCalendars() kończy wcześnie.
+    void runExtraCalendars();
+    void runOneExtraCalendar(const string & url);
     void runForCalendar(string id, string name, string path);
     bool runForCalendarWithSyncToken(string calendarId, string url, shared_ptr<Calendar> calendar, int retryCount = 0);
 

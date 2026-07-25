@@ -644,13 +644,84 @@ shared_ptr<ContactBook> DAVWorker::resolveAddressBook() {
  Returns the calendar home-set URL, or "" if CalDAV is not available.
  Throws SyncException on transient errors; caller handles.
 */
+/*
+ #267: kandydaci na host CalDAV, w kolejności prób.
+
+ WS2-F słusznie usunęło auto-discovery przez Foundry (/api/resolve-dav-hosts —
+ endpoint wysyłał domenę i host IMAP użytkownika do id.getmailspring.com), ale
+ nie dostarczyło zamiennika: host był zahardkodowany na "", więc discovery
+ kończyło się przed pierwszym żądaniem i kalendarz nie działał dla ŻADNEGO konta
+ poza Gmailem (ten ma calHost ustawiony w konstruktorze). Efektem był martwy kod
+ i cicha awaria — w logu 90 prób discovery bez jednego kalendarza i bez błędu.
+
+ Zamiennik jest standardowy i lokalny: pytamy wyłącznie serwer użytkownika,
+ zgodnie z RFC 6764. Żadnych usług trzecich.
+*/
+vector<string> DAVWorker::calendarHostCandidates() {
+    vector<string> out;
+    auto add = [&out](const string & h) {
+        if (h.empty()) return;
+        for (const auto & existing : out) {
+            if (existing == h) return;
+        }
+        out.push_back(h);
+    };
+
+    // 1. Jawne ustawienie konta — zawsze wygrywa.
+    try {
+        add(account->CalDAVHost());
+    } catch (...) {
+        // brak klucza w settings — nie szkodzi
+    }
+
+    // 2. Domena adresu e-mail — kanoniczny punkt startowy RFC 6764.
+    try {
+        string email = account->emailAddress();
+        size_t at = email.find('@');
+        if (at != string::npos && at + 1 < email.size()) {
+            add(email.substr(at + 1));
+        }
+    } catch (...) {
+    }
+
+    // 3. Host IMAP — w małych wdrożeniach ten sam serwer obsługuje pocztę i DAV.
+    try {
+        add(account->IMAPHost());
+    } catch (...) {
+    }
+
+    return out;
+}
+
 string DAVWorker::resolveCalendarHomeURL() {
-    // WS2-F (Actuna Mail): see resolveAddressBook above. CalDAV
-    // auto-discovery via Foundry's /api/resolve-dav-hosts is removed.
-    // Caller treats empty as "no CalDAV" and skips calendar sync for
-    // accounts that did not provide an explicit CalDAV host.
-    string caldavHost = "";
-    if (caldavHost == "") {
+    vector<string> candidates = calendarHostCandidates();
+    if (candidates.empty()) {
+        logger->info("CalDAV: no candidate host for discovery, skipping calendar sync");
+        return "";
+    }
+
+    for (const string & host : candidates) {
+        try {
+            string homeSet = discoverCalendarHomeAt(host);
+            if (!homeSet.empty()) {
+                logger->info("CalDAV: calendar home-set discovered via host {}", host);
+                return homeSet;
+            }
+            logger->info("CalDAV: host {} did not yield a calendar home-set", host);
+        } catch (SyncException & e) {
+            // Awaria sieci jest przejściowa — niech zdecyduje runCalendars()
+            // (nie zamyka discovery na stałe, spróbuje w kolejnym cyklu).
+            if (e.isOffline()) throw;
+            logger->info("CalDAV: discovery on host {} failed ({}), trying next", host, e.key);
+        }
+    }
+
+    logger->info("CalDAV: no calendar home-set found (tried {} candidate host(s))", candidates.size());
+    return "";
+}
+
+string DAVWorker::discoverCalendarHomeAt(const string & caldavHost) {
+    if (caldavHost.empty()) {
         return "";
     }
 
@@ -698,15 +769,17 @@ string DAVWorker::resolveCalendarHomeURL() {
 }
 
 string DAVWorker::resolvedCalendarURL(const string & calPath) {
+    // Absolutny URL zawsze wygrywa — #269 zapisuje takie w `Calendar::path()` dla
+    // kalendarzy dodanych ręcznie. Sprawdzamy to PRZED `calHost`, bo na koncie
+    // Gmail konkatenacja dałaby "apidata.googleusercontent.com" + "https://...".
+    if (calPath.find("://") != string::npos) {
+        return calPath;
+    }
     // Gmail uses calHost set in the constructor.
     if (calHost != "") {
         return calHost + calPath;
     }
     // All other accounts: resolve against the discovered calendar home-set URL.
-    // If the server returned the calendar path as an absolute URL, use it directly.
-    if (calPath.find("://") != string::npos) {
-        return calPath;
-    }
     // Lazily perform CalDAV discovery if this is a fresh DAVWorker instance
     // (e.g., created by TaskProcessor for a single syncback task without a prior
     // runCalendars() call having populated the cache).
@@ -1263,7 +1336,137 @@ void DAVWorker::rebuildContactGroup(shared_ptr<Contact> contact) {
     group->syncMembers(store, members);
 }
 
+/*
+ #269 — normalizacja adresu kalendarza podanego ręcznie. Zwraca "" dla adresu,
+ którego NIE umiemy obsłużyć.
+
+ Dopuszczamy wyłącznie http/https, i to nie z ostrożności formalnej: `DavXML`
+ rzuca `throw new SyncException(...)` — czyli WSKAŹNIK, którego żaden
+ `catch (SyncException &)` w tym pliku nie łapie. Odpowiedź nie-XML (a taką da
+ subskrypcja `webcal://` albo surowy plik `.ics`, bo to `text/calendar`) ubiłaby
+ cały wątek kalendarza i kontaktów aż do restartu aplikacji.
+ Subskrypcje ICS wymagają osobnej ścieżki (GET + ETag), nie CalDAV-owego PROPFIND.
+*/
+static string normalizedExtraCalendarURL(const string & raw) {
+    string url = raw;
+    // trim
+    while (!url.empty() && (url.front() == ' ' || url.front() == '\t')) url.erase(url.begin());
+    while (!url.empty() && (url.back() == ' ' || url.back() == '\t' || url.back() == '\n')) url.pop_back();
+    if (url.empty()) return "";
+
+    if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) return "";
+
+    // Kolekcja CalDAV kończy się ukośnikiem; bez niego serwery potrafią oddać
+    // zasób zamiast kolekcji, a `idForCalendar` liczyłby inne id dla tego samego
+    // kalendarza w zależności od tego, jak użytkownik go wpisał.
+    if (url.back() != '/') url += '/';
+    return url;
+}
+
+void DAVWorker::runExtraCalendars() {
+    vector<string> raw = account->CalDAVExtraURLs();
+    if (raw.empty()) return;
+
+    for (const string & entry : raw) {
+        const string url = normalizedExtraCalendarURL(entry);
+        if (url == "") {
+            logger->info("CalDAV: skipping calendar address '{}' — only http/https CalDAV collections are supported", entry);
+            continue;
+        }
+        // Jeden zły adres nie może przewrócić pozostałych ani ubić wątku.
+        try {
+            runOneExtraCalendar(url);
+        } catch (SyncException & e) {
+            logger->info("CalDAV: extra calendar {} failed ({}), skipping", url, e.key);
+        } catch (SyncException * e) {
+            logger->info("CalDAV: extra calendar {} failed ({}), skipping", url, e->key);
+            delete e;
+        } catch (std::exception & e) {
+            logger->info("CalDAV: extra calendar {} failed ({}), skipping", url, e.what());
+        } catch (...) {
+            logger->info("CalDAV: extra calendar {} failed (unknown error), skipping", url);
+        }
+    }
+}
+
+void DAVWorker::runOneExtraCalendar(const string & url) {
+    // Depth: 0 — to jest KONKRETNA kolekcja, nie lista kolekcji. Domyślne
+    // Depth: 1 zwróciłoby propstat każdego pliku .ics w środku, a
+    // nodeContentAtXPath zwraca OSTATNIE trafienie, więc nazwa i ctag
+    // pochodziłyby z przypadkowego wydarzenia.
+    string propfindQuery =
+        "<d:propfind xmlns:d=\"DAV:\" xmlns:cs=\"http://calendarserver.org/ns/\" "
+        "xmlns:c=\"urn:ietf:params:xml:ns:caldav\" xmlns:ical=\"http://apple.com/ns/ical/\">"
+        "<d:prop>"
+        "<d:resourcetype />"
+        "<d:displayname />"
+        "<cs:getctag />"
+        "<ical:calendar-color />"
+        "<c:calendar-description />"
+        "<ical:calendar-order />"
+        "</d:prop>"
+        "</d:propfind>";
+
+    auto doc = performXMLRequest(url, "PROPFIND", propfindQuery, "0");
+
+    string name, ctag, color, description, orderStr;
+    // Bez predykatu supported-calendar-component-set: ta właściwość jest w RFC 4791
+    // opcjonalna, a użytkownik już zadeklarował, że to kalendarz — filtrowanie po
+    // niej wyrzucałoby poprawne kolekcje po cichu, bez żadnego logu.
+    doc->evaluateXPath("//D:response", ([&](xmlNodePtr node) {
+        name = doc->nodeContentAtXPath(".//D:displayname/text()", node);
+        ctag = doc->nodeContentAtXPath(".//cs:getctag/text()", node);
+        color = doc->nodeContentAtXPath(".//ical:calendar-color/text()", node);
+        description = doc->nodeContentAtXPath(".//caldav:calendar-description/text()", node);
+        orderStr = doc->nodeContentAtXPath(".//ical:calendar-order/text()", node);
+    }));
+
+    if (name == "") name = url;
+
+    auto id = MailUtils::idForCalendar(account->id(), url);
+    auto calendar = store->find<Calendar>(Query().equal("id", id));
+
+    if (!calendar) {
+        calendar = make_shared<Calendar>(id, account->id());
+        calendar->setPath(url);
+        calendar->setName(name);
+        if (color != "") calendar->setColor(color);
+        if (description != "") calendar->setDescription(description);
+        if (orderStr != "") calendar->setOrder(atoi(orderStr.c_str()));
+        // Na razie tylko do odczytu: ścieżka zapisu (hrefForNewEvent + replacePath)
+        // zakłada ścieżkę względną wobec calendar-home-set, więc dla kalendarza
+        // pod obcym adresem wyprodukowałaby błędny URL PUT-a.
+        calendar->setReadOnly(true);
+        store->save(calendar.get());
+        logger->info("CalDAV: added manually configured calendar '{}' ({})", name, url);
+    } else if (calendar->name() != name && name != url) {
+        calendar->setName(name);
+        store->save(calendar.get());
+    }
+
+    bool usedSyncToken = runForCalendarWithSyncToken(id, url, calendar);
+    if (!usedSyncToken) {
+        runForCalendar(id, name, url);
+    }
+
+    if (ctag != "" && calendar->ctag() != ctag) {
+        calendar->setCtag(ctag);
+        store->save(calendar.get());
+    }
+}
+
 void DAVWorker::runCalendars() {
+    // #268 — użytkownik może wyłączyć kalendarz dla konta w ustawieniach.
+    if (!account->CalDAVEnabled()) {
+        logger->info("CalDAV: calendar sync disabled for this account in settings");
+        return;
+    }
+
+    // #269 — kalendarze wskazane ręcznie synchronizujemy PRZED discovery: poniżej
+    // jest sześć wcześniejszych `return` (brak CalDAV, serwer nieosiągalny, puste
+    // discovery), a jawny adres podaje się dokładnie w tych sytuacjach.
+    runExtraCalendars();
+
     // Gmail uses calHost/calPrincipal set in constructor.
     // All other accounts use dynamic discovery (cached after first run).
     string calendarHomeURL = "";
@@ -1990,6 +2193,18 @@ bool DAVWorker::runForCalendarWithSyncToken(string calendarId, string url, share
 // WWW-Authenticate. This is more efficient (avoids an extra round-trip) and sidesteps
 // all server-specific header formatting quirks.
 const string DAVWorker::getAuthorizationHeader() {
+    // #268: serwer kalendarza bywa inny niż serwer poczty i wymaga osobnego
+    // loginu — jeśli użytkownik podał poświadczenia DAV, mają pierwszeństwo.
+    // Dotyczy też CardDAV: te same poświadczenia obsługują zwykle oba protokoły
+    // na tym samym serwerze.
+    const string davUser = account->CalDAVUsername();
+    const string davPass = account->CalDAVPassword();
+    if (davUser != "" && davPass != "") {
+        string davPlain = davUser + ":" + davPass;
+        string davEncoded = MailUtils::toBase64(davPlain.c_str(), strlen(davPlain.c_str()));
+        return "Authorization: Basic " + davEncoded;
+    }
+
     if (account->refreshToken() != "") {
         auto parts = SharedXOAuth2TokenManager()->partsForAccount(account);
         return "Authorization: Bearer " + parts.accessToken;

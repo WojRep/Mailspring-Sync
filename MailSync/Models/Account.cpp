@@ -125,6 +125,45 @@ bool Account::isICloud() {
     return IMAPHost().find("imap.mail.me.com") != string::npos;
 }
 
+string Account::CalDAVHost() {
+    json & s = _data["settings"];
+    if (!s.count("caldav_host") || !s["caldav_host"].is_string()) return "";
+    return s["caldav_host"].get<string>();
+}
+
+string Account::CalDAVUsername() {
+    json & s = _data["settings"];
+    if (!s.count("caldav_username") || !s["caldav_username"].is_string()) return "";
+    return s["caldav_username"].get<string>();
+}
+
+string Account::CalDAVPassword() {
+    json & s = _data["settings"];
+    if (!s.count("caldav_password") || !s["caldav_password"].is_string()) return "";
+    return s["caldav_password"].get<string>();
+}
+
+bool Account::CalDAVEnabled() {
+    json & s = _data["settings"];
+    // Domyślnie WŁĄCZONE — konta zapisane przed wprowadzeniem tego pola
+    // (#268) nie mają go wcale, a synchronizacja kalendarza była dla nich
+    // aktywna. Wyłącza wyłącznie jawne `false`.
+    if (!s.count("caldav_enabled") || !s["caldav_enabled"].is_boolean()) return true;
+    return s["caldav_enabled"].get<bool>();
+}
+
+vector<string> Account::CalDAVExtraURLs() {
+    vector<string> out;
+    json & s = _data["settings"];
+    if (!s.count("caldav_extra_urls") || !s["caldav_extra_urls"].is_array()) return out;
+    for (auto & entry : s["caldav_extra_urls"]) {
+        if (!entry.is_string()) continue;
+        string v = entry.get<string>();
+        if (!v.empty()) out.push_back(v);
+    }
+    return out;
+}
+
 unsigned int Account::SMTPPort() {
     json & val = _data["settings"]["smtp_port"];
     return val.is_string() ? stoi(val.get<string>()) : val.get<unsigned int>();

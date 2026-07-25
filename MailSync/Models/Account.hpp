@@ -51,6 +51,22 @@ public:
 
     bool isICloud();
 
+    // #267: jawny host CalDAV/CardDAV z ustawień konta ("" gdy nieustawiony).
+    // Pierwszy kandydat discovery; gdy pusty, host wyprowadzamy standardowo
+    // (RFC 6764) z domeny adresu i hosta IMAP.
+    string CalDAVHost();
+
+    // #268: własne poświadczenia serwera kalendarza ("" = użyj poświadczeń
+    // konta pocztowego) oraz włącznik synchronizacji kalendarza.
+    string CalDAVUsername();
+    string CalDAVPassword();
+    bool CalDAVEnabled();
+
+    // #269: kalendarze dodane ręcznie przez użytkownika (pełne adresy kolekcji
+    // CalDAV). Synchronizowane niezależnie od calendar-home-set — właśnie po to,
+    // by dało się wskazać kalendarz, którego discovery nie znajduje.
+    vector<string> CalDAVExtraURLs();
+
     unsigned int SMTPPort();
     string SMTPHost();
     string SMTPUsername();
