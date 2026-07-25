@@ -46,6 +46,24 @@
 
 using namespace std;
 using namespace mailcore;
+
+/*
+ #271 — nazwa klienta w nagłówku `X-Mailer` wychodzącej poczty.
+
+ `MessageHeader::setUserAgent()` w mailcore2 ustawia dosłownie `X-Mailer`, więc
+ zaszyte tu „Mailspring" jechało w KAŻDEJ wysłanej wiadomości i w każdej
+ odpowiedzi na zaproszenie kalendarzowe — widoczne dla odbiorcy i dla każdego
+ serwera po drodze. Wartość bierzemy ze środowiska (renderer podaje
+ `ACTUNA_USER_AGENT`, patrz mailsync-process.ts), z ActunaMail jako domyślną,
+ spójnie ze wzorcem użytym już w MCSMTPSession.cpp dla wiadomości testowej.
+*/
+static String * outgoingUserAgent() {
+    string configured = MailUtils::getEnvUTF8("ACTUNA_USER_AGENT");
+    if (configured.empty()) {
+        configured = "ActunaMail";
+    }
+    return String::stringWithUTF8Characters(configured.c_str());
+}
 using namespace nlohmann;
 
 static void setFileModificationTime(const string & filepath, time_t timestamp) {
@@ -1676,7 +1694,7 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
 
     builder.header()->setSubject(AS_MCSTR(draft.subject()));
     builder.header()->setMessageID(AS_MCSTR(draft.headerMessageId()));
-    builder.header()->setUserAgent(MCSTR("Mailspring"));
+    builder.header()->setUserAgent(outgoingUserAgent());
     builder.header()->setDate(time(0));
     
     // todo: lookup thread reference entire chain?
@@ -2418,7 +2436,7 @@ void TaskProcessor::performRemoteSendRSVP(Task * task) {
     }
 
     // Generate a unique boundary for multipart message
-    string boundary = "----=_Mailspring_RSVP_" + to_string(time(0)) + "_" + to_string(rand());
+    string boundary = "----=_ActunaMail_RSVP_" + to_string(time(0)) + "_" + to_string(rand());
 
     // Base64 encode the ICS data (RFC 6047 recommends base64 for maximum compatibility)
     Data * icsData = AS_MCSTR(ics)->dataUsingEncoding("utf-8");
@@ -2427,7 +2445,7 @@ void TaskProcessor::performRemoteSendRSVP(Task * task) {
     // Build MIME headers
     MessageBuilder builder;
     builder.header()->setSubject(AS_MCSTR(subject));
-    builder.header()->setUserAgent(MCSTR("Mailspring"));
+    builder.header()->setUserAgent(outgoingUserAgent());
     builder.header()->setDate(time(0));
 
     Array * toArray = Array::array();
