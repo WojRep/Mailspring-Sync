@@ -26,7 +26,10 @@ DavXML::DavXML(string xml, string url):
     // compatibility with non-compliant servers.
     doc = xmlReadMemory(xml.c_str(), (int)xml.size(), url.c_str(), "utf-8", 0);
     if (doc == nullptr) {
-        throw new SyncException("Unable to parse CalDav XML", xml, false);
+        // #267 — przez wartość: wszyscy wywołujący łapią `SyncException &`.
+        // Wskaźnik (`throw new`) uciekał do `catch (...)` w main.cpp i ubijał
+        // wątek kalendarza i kontaktów, gdy serwer oddał HTML zamiast XML.
+        throw SyncException("Unable to parse CalDav XML", xml, false);
     }
 }
 

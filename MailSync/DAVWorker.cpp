@@ -1340,11 +1340,10 @@ void DAVWorker::rebuildContactGroup(shared_ptr<Contact> contact) {
  #269 — normalizacja adresu kalendarza podanego ręcznie. Zwraca "" dla adresu,
  którego NIE umiemy obsłużyć.
 
- Dopuszczamy wyłącznie http/https, i to nie z ostrożności formalnej: `DavXML`
- rzuca `throw new SyncException(...)` — czyli WSKAŹNIK, którego żaden
- `catch (SyncException &)` w tym pliku nie łapie. Odpowiedź nie-XML (a taką da
- subskrypcja `webcal://` albo surowy plik `.ics`, bo to `text/calendar`) ubiłaby
- cały wątek kalendarza i kontaktów aż do restartu aplikacji.
+ Dopuszczamy wyłącznie http/https: dodany adres synchronizujemy CalDAV-owym
+ PROPFIND-em, a subskrypcja `webcal://` albo surowy plik `.ics` odpowiada
+ `text/calendar`, czyli nie-XML — `DavXML` zgłosi błąd parsowania i kalendarz
+ nigdy się nie zsynchronizuje (#267: od tej pory już bez ubijania wątku).
  Subskrypcje ICS wymagają osobnej ścieżki (GET + ETag), nie CalDAV-owego PROPFIND.
 */
 static string normalizedExtraCalendarURL(const string & raw) {
@@ -1378,9 +1377,6 @@ void DAVWorker::runExtraCalendars() {
             runOneExtraCalendar(url);
         } catch (SyncException & e) {
             logger->info("CalDAV: extra calendar {} failed ({}), skipping", url, e.key);
-        } catch (SyncException * e) {
-            logger->info("CalDAV: extra calendar {} failed ({}), skipping", url, e->key);
-            delete e;
         } catch (std::exception & e) {
             logger->info("CalDAV: extra calendar {} failed ({}), skipping", url, e.what());
         } catch (...) {
