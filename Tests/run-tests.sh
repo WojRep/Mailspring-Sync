@@ -31,4 +31,12 @@ clang++ "${CXXFLAGS[@]}" "$ROOT/Tests/davxml-exception-test.cpp" "$ROOT/MailSync
   "${SUPPORT[@]}" -lxml2 -lcurl -o "$OUT/davxml-exception-test"
 "$OUT/davxml-exception-test" 2>/dev/null || status=1
 
+echo "== append-message-test (#325)"
+clang++ "${CXXFLAGS[@]}" "$ROOT/Tests/append-message-test.cpp" \
+  "${SUPPORT[@]}" -lcurl -o "$OUT/append-message-test" && "$OUT/append-message-test" || status=1
+
+echo "== mail-selection-test (#325)"
+clang++ "${CXXFLAGS[@]}" "$ROOT/Tests/mail-selection-test.cpp" -o "$OUT/mail-selection-test" \
+  && "$OUT/mail-selection-test" || status=1
+
 exit $status

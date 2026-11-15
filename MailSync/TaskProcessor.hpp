@@ -23,6 +23,8 @@
 #include "MailModel.hpp"
 #include "MailStore.hpp"
 #include "Account.hpp"
+#include "AppendMessage.hpp"
+#include "MailSelection.hpp"
 #include <MailCore/MailCore.h>
 
 using namespace nlohmann;
@@ -98,6 +100,7 @@ private:
 
     void performRemoteExpungeAllInFolder(Task * task);
     void performRemoteGetMessageRFC2822(Task * task);
+    void performRemoteAppendMessage(Task * task);
     void performRemoteGetManyRFC2822(Task * task);
     void performRemoteSendRSVP(Task * task);
 

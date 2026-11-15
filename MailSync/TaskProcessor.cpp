@@ -598,6 +598,9 @@ void TaskProcessor::performLocal(Task * task) {
         } else if (cname == "DestroyEventTask") {
             performLocalDestroyEvent(task);
 
+        } else if (cname == "AppendMessageTask") {
+            // #325 — nic lokalnie; wiadomość pojawi się w bazie przy synchronizacji folderu.
+
         } else {
             logger->error("Unsure of how to process this task type {}", cname);
         }
@@ -679,6 +682,9 @@ void TaskProcessor::performRemote(Task * task) {
 
             } else if (cname == "GetManyRFC2822Task") {
                 performRemoteGetManyRFC2822(task);
+
+            } else if (cname == "AppendMessageTask") {
+                performRemoteAppendMessage(task);
 
             } else if (cname == "EventRSVPTask") {
                 performRemoteSendRSVP(task);
@@ -799,14 +805,17 @@ Message TaskProcessor::inflateClientDraftJSON(json & draftJSON, shared_ptr<Messa
 ChangeMailModels TaskProcessor::inflateMessages(json & data) {
     ChangeMailModels models;
 
-    if (data.count("threadIds")) {
+    // #325 — rozstrzyga NIEPUSTE pole: klient wysyła oba (puste, gdy nieużywane),
+    // więc zadanie na samych wiadomościach (threadIds: []) wcześniej nic nie robiło.
+    MailSelection selection = mailSelectionFor(data);
+    if (selection == MailSelection::Threads) {
         vector<string> threadIds{};
         for (auto & member : data["threadIds"]) {
             threadIds.push_back(member.get<string>());
         }
         models.messages = store->findLargeSet<Message>("threadId", threadIds);
 
-    } else if (data.count("messageIds")) {
+    } else if (selection == MailSelection::Messages) {
         vector<string> messageIds{};
         for (auto & member : data["messageIds"]) {
             messageIds.push_back(member.get<string>());
@@ -2113,6 +2122,39 @@ void TaskProcessor::performRemoteGetMessageRFC2822(Task * task) {
     data->writeToFile(AS_MCSTR(filepath));
 #endif
     setFileModificationTime(filepath, msg->date());
+}
+
+// #325 — wgranie pliku .eml do folderu tego konta (przeniesienie między kontami).
+// `appended: true` ustawiane WYŁĄCZNIE po udanym APPEND — klient usuwa oryginał
+// z konta źródłowego tylko z tym potwierdzeniem.
+void TaskProcessor::performRemoteAppendMessage(Task * task) {
+    AutoreleasePool pool;
+    AppendRequest req = parseAppendRequest(task->data());
+
+#ifdef _MSC_VER
+    wstring_convert<codecvt_utf8<wchar_t>, wchar_t> convert;
+    Data * data = Data::dataWithContentsOfFile(AS_WIDE_MCSTR(convert.from_bytes(req.filepath)));
+#else
+    Data * data = Data::dataWithContentsOfFile(AS_MCSTR(req.filepath));
+#endif
+    if (data == nullptr || data->length() == 0) {
+        throw SyncException("append-missing-file", "AppendMessageTask: message file is missing or empty.", false);
+    }
+
+    IMAPProgress cb;
+    ErrorCode err = ErrorNone;
+    uint32_t createdUID = 0;
+    session->appendMessageWithCustomFlagsAndDate(AS_MCSTR(req.folderPath), data, appendFlagsFor(req.unread, req.starred),
+                                                 nullptr, req.date, &cb, &createdUID, &err);
+    if (err != ErrorNone) {
+        logger->error("Unable to append message to '{}'. Error {}", req.folderPath, ErrorCodeToTypeMap[err]);
+        throw SyncException(err, "performRemoteAppendMessage");
+    }
+    task->data()["appended"] = true;
+    if (createdUID > 0) {
+        task->data()["createdUID"] = createdUID;
+    }
+    logger->info("Appended message to '{}' (UID {}).", req.folderPath, createdUID);
 }
 
 std::string TaskProcessor::sanitizeEmlFilename(const std::string & subject, time_t date, int index) {
