@@ -39,4 +39,16 @@ echo "== mail-selection-test (#325)"
 clang++ "${CXXFLAGS[@]}" "$ROOT/Tests/mail-selection-test.cpp" -o "$OUT/mail-selection-test" \
   && "$OUT/mail-selection-test" || status=1
 
+SQLITECPP=("$ROOT/Vendor/SQLiteCpp/src/Database.cpp" "$ROOT/Vendor/SQLiteCpp/src/Statement.cpp"
+  "$ROOT/Vendor/SQLiteCpp/src/Column.cpp" "$ROOT/Vendor/SQLiteCpp/src/Exception.cpp" "$ROOT/Vendor/SQLiteCpp/src/Backup.cpp")
+
+echo "== query-test (#327)"
+clang++ "${CXXFLAGS[@]}" -DSQLITE_OMIT_LOAD_EXTENSION -I"$ROOT/MailSync/Models" -I"$ROOT/Vendor/SQLiteCpp/include" "$ROOT/Tests/query-test.cpp" "$ROOT/MailSync/Query.cpp" \
+  "$ROOT/Tests/stubs/mailutils-qmarks.cpp" "${SQLITECPP[@]}" "${SUPPORT[@]}" -lsqlite3 -lcurl \
+  -o "$OUT/query-test" && "$OUT/query-test" || status=1
+
+echo "== uid-reconcile-test (#327)"
+clang++ "${CXXFLAGS[@]}" "$ROOT/Tests/uid-reconcile-test.cpp" -o "$OUT/uid-reconcile-test" \
+  && "$OUT/uid-reconcile-test" || status=1
+
 exit $status

@@ -72,7 +72,11 @@ private:
 
     bool initialSyncFolderIncremental(Folder & folder, IMAPFolderStatus & remoteStatus);
         
-    void syncFolderUIDRange(Folder & folder, Range range, bool heavyInitialRequest, vector<shared_ptr<Message>> * syncedMessages = nullptr);
+    // #327: true = w zakresie zostały brakujące wiadomości ponad limit jednej partii (do dociągnięcia).
+    bool syncFolderUIDRange(Folder & folder, Range range, bool heavyInitialRequest, vector<shared_ptr<Message>> * syncedMessages = nullptr);
+    // #327: pełne uzgodnienie folderu z serwerem (lista UID) — zwraca true, gdy zostało więcej do dociągnięcia.
+    bool reconcileFolderWithServer(Folder & folder, uint32_t remoteUIDNext);
+    int64_t linkedMessageCount(Folder & folder);
 
     void syncFolderChangesViaCondstore(Folder & folder, IMAPFolderStatus & remoteStatus, bool mustSyncAll);
 

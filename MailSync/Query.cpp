@@ -19,50 +19,58 @@ using namespace std;
 
 // TODO: figure out how to use templates for this
 
-Query::Query() noexcept : _clauses({}), _limit(0), _orderBy(""), _orderDir("ASC") {
+Query::Query() noexcept : _clauses(json::array()), _limit(0), _orderBy(""), _orderDir("ASC") {
+}
+
+// #327 — warunki to LISTA {col, op, rhs}. Wcześniej obiekt JSON z kluczem =
+// nazwa kolumny: `.gte("remoteUID", a).lt("remoteUID", b)` zostawiało samo
+// `remoteUID < b`, przez co obsługa VANISHED odłączała wszystkie wiadomości
+// poniżej zakresu. Ten sam operator na tej samej kolumnie nadal ZASTĘPUJE
+// poprzedni (dotychczasowa semantyka), różne operatory łączą się przez AND.
+Query & Query::_set(const string & col, const string & op, const json & rhs) {
+    for (auto it = _clauses.begin(); it != _clauses.end(); ++it) {
+        if ((*it)["col"] == col && (*it)["op"] == op) {
+            _clauses.erase(it);
+            break;
+        }
+    }
+    _clauses.push_back({{"col", col}, {"op", op}, {"rhs", rhs}});
+    return *this;
 }
 
 Query & Query::equal(string col, string val) {
-    _clauses[col] = {{"op","="}, {"rhs", val}};
-    return *this;
+    return _set(col, "=", val);
 }
 
 Query & Query::equal(string col, double val) {
-    _clauses[col] = {{"op","="}, {"rhs", val}};
-    return *this;
+    return _set(col, "=", val);
 }
 
 Query & Query::equal(string col, vector<string> & val) {
     if (val.size() > 999) {
         spdlog::get("logger")->warn("Attempting to construct WHERE {} IN () query with >999 values ({}), this will fail and should be reported.", col, val.size());
     }
-    _clauses[col] = {{"op","="}, {"rhs", val}};
-    return *this;
+    return _set(col, "=", val);
 }
 
 Query & Query::equal(string col, vector<uint32_t> & val) {
-    _clauses[col] = {{"op","="}, {"rhs", val}};
-    return *this;
+    return _set(col, "=", val);
 }
 
 Query & Query::gt(string col, double val) {
-    _clauses[col] = {{"op",">"}, {"rhs", val}};
-    return *this;
+    return _set(col, ">", val);
 }
 
 Query & Query::gte(string col, double val) {
-    _clauses[col] = {{"op",">="}, {"rhs", val}};
-    return *this;
+    return _set(col, ">=", val);
 }
 
 Query & Query::lt(string col, double val) {
-    _clauses[col] = {{"op","<"}, {"rhs", val}};
-    return *this;
+    return _set(col, "<", val);
 }
 
 Query & Query::lte(string col, double val) {
-    _clauses[col] = {{"op","<="}, {"rhs", val}};
-    return *this;
+    return _set(col, "<=", val);
 }
 
 Query & Query::limit(int l) {
@@ -90,8 +98,9 @@ string Query::getSQL() {
             if (it != _clauses.begin()) {
                 result += " AND ";
             }
-            string op = it.value()["op"].get<string>();
-            json & rhs = it.value()["rhs"];
+            string col = (*it)["col"].get<string>();
+            string op = (*it)["op"].get<string>();
+            json & rhs = (*it)["rhs"];
             
             if (rhs.is_array()) {
                 if (op != "=") {
@@ -101,9 +110,9 @@ string Query::getSQL() {
                     result += "0 = 1";
                     continue;
                 }
-                result += it.key() + " IN (" + MailUtils::qmarks(rhs.size()) + ")";
+                result += col + " IN (" + MailUtils::qmarks(rhs.size()) + ")";
             } else {
-                result += it.key() + " " + op + " ?";
+                result += col + " " + op + " ?";
             }
         }
     }
@@ -116,7 +125,7 @@ string Query::getSQL() {
 void Query::bind(SQLite::Statement & query) {
     int ii = 1;
     for (json::iterator it = _clauses.begin(); it != _clauses.end(); ++it) {
-        json & rhs = it.value()["rhs"];
+        json & rhs = (*it)["rhs"];
 
         if (rhs.is_array()) {
             for (json::iterator at = rhs.begin(); at != rhs.end(); ++at) {

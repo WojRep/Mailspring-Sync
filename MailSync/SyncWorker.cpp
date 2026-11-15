@@ -11,6 +11,7 @@
 #include <algorithm>
 
 #include "SyncWorker.hpp"
+#include "UIDReconcile.hpp"
 #include "MailUtils.hpp"
 #include "MailStoreTransaction.hpp"
 #include "Folder.hpp"
@@ -40,6 +41,10 @@
 #define LS_BODIES_PRESENT           "bodiesPresent"  // *
 #define LS_BODIES_WANTED            "bodiesWanted"   // *
 #define LS_LAST_CLEANUP             "lastCleanup"
+// #327 — pełne uzgadnianie folderu z serwerem przy CONDSTORE/QRESYNC
+#define LS_LAST_RECONCILE           "lastReconcile"
+#define LS_LAST_RECONCILE_ATTEMPT   "lastReconcileAttempt"
+#define LS_FORCE_RECONCILE          "forceReconcile"
 /// IMPORTANT: deep/shallow are only used for some IMAP servers
 #define LS_LAST_SHALLOW             "lastShallow"
 #define LS_LAST_DEEP                "lastDeep"
@@ -224,7 +229,7 @@ void SyncWorker::idleCycleIteration()
             throw SyncException("no-inbox", "There is no inbox or all folder to IDLE on.", false);
         }
     }
-    json inboxInitialStatus { inbox->localStatus() };
+    json inboxInitialStatus = inbox->localStatus(); // #327: {} tworzyło tablicę [status], nie kopię
     
     if (idleShouldReloop) {
         idleShouldReloop = false;
@@ -261,7 +266,7 @@ void SyncWorker::idleCycleIteration()
             syncFolderChangesViaCondstore(*inbox, remoteStatus, false);
         } else {
             uint32_t uidnext = remoteStatus.uidNext();
-            uint32_t syncedMinUID = inbox->localStatus()[LS_SYNCED_MIN_UID].get<uint32_t>();
+            uint32_t syncedMinUID = lsNumberOr<uint32_t>(inbox->localStatus(), LS_SYNCED_MIN_UID, 1); // #327: null-safe
             uint32_t bottomUID = store->fetchMessageUIDAtDepth(*inbox, 100, uidnext);
             if (bottomUID < syncedMinUID) { bottomUID = syncedMinUID; }
             // Guard against underflow if uidnext <= bottomUID (server inconsistency)
@@ -404,7 +409,7 @@ bool SyncWorker::syncNow()
             continue;
         }
 
-        if (localStatus[LS_UIDVALIDITY].get<uint32_t>() != remoteStatus.uidValidity()) {
+        if (lsNumberOr<uint32_t>(localStatus, LS_UIDVALIDITY, 0) != remoteStatus.uidValidity()) { // #327: null-safe
             // UID Invalidity means that the UIDs the server previously reported for messages
             // in this folder can no longer be used. To recover from this, we need to:
             //
@@ -429,7 +434,7 @@ bool SyncWorker::syncNow()
             if (localStatus.count(LS_UIDVALIDITY_RESET_COUNT) == 0) {
                 localStatus[LS_UIDVALIDITY_RESET_COUNT] = 1;
             }
-            localStatus[LS_UIDVALIDITY_RESET_COUNT] = localStatus[LS_UIDVALIDITY_RESET_COUNT].get<uint32_t>() + 1;
+            localStatus[LS_UIDVALIDITY_RESET_COUNT] = lsNumberOr<uint32_t>(localStatus, LS_UIDVALIDITY_RESET_COUNT, 0) + 1;
             localStatus[LS_HIGHESTMODSEQ] = remoteStatus.highestModSeqValue();
             localStatus[LS_UIDVALIDITY] = remoteStatus.uidValidity();
             localStatus[LS_UIDNEXT] = remoteStatus.uidNext();
@@ -463,9 +468,38 @@ bool SyncWorker::syncNow()
         // CONDSTORE, when available, does A + B.
         // XYZRESYNC, when available, does C
         if (hasCondstore && hasQResync) {
-            // Hooray! We never need to fetch the entire range to sync. Just look at
-            // highestmodseq / uidnext and sync if we need to.
+            // Just look at highestmodseq / uidnext and sync if we need to...
             syncFolderChangesViaCondstore(*folder, remoteStatus, true);
+
+            // #327 — ...ALE okresowo uzgadniamy cały folder z serwerem. Wcześniej
+            // przy CONDSTORE/QRESYNC nie robiliśmy tego nigdy: wiadomości utracone
+            // lokalnie (np. przez błędne odłączenie) nigdy nie wracały, a status
+            // twierdził „zsynchronizowane”. Tak robią inne klienty (Apple Mail,
+            // Thunderbird): QRESYNC to optymalizacja, nie jedyne źródło prawdy.
+            if (syncedMinUID == 1) {
+                time_t now = time(0);
+                int64_t localN = linkedMessageCount(*folder);
+                int64_t remoteN = remoteStatus.messageCount();
+                bool force = localStatus.count(LS_FORCE_RECONCILE) && localStatus[LS_FORCE_RECONCILE].is_boolean() && localStatus[LS_FORCE_RECONCILE].get<bool>();
+                if (force || reconcileDue(now, lsNumberOr<time_t>(localStatus, LS_LAST_RECONCILE, 0),
+                                          lsNumberOr<time_t>(localStatus, LS_LAST_RECONCILE_ATTEMPT, 0),
+                                          localN, remoteN, iterationsSinceLaunch)) {
+                    logger->info("Reconcile {}: server {} messages, local {} — comparing full UID list", folder->path(), remoteN, localN);
+                    bool more = reconcileFolderWithServer(*folder, remoteStatus.uidNext());
+                    int64_t after = linkedMessageCount(*folder);
+                    logger->info("Reconcile {}: done, server {}, local {}{}", folder->path(), remoteN, after, more ? " (more to fetch)" : "");
+                    if (more) {
+                        // Następna partia w kolejnym cyklu, bez czekania 30 min.
+                        localStatus[LS_LAST_RECONCILE_ATTEMPT] = 0;
+                        localStatus[LS_FORCE_RECONCILE] = true;
+                        syncAgainImmediately = true;
+                    } else {
+                        localStatus[LS_LAST_RECONCILE_ATTEMPT] = now;
+                        localStatus[LS_LAST_RECONCILE] = now;
+                        localStatus[LS_FORCE_RECONCILE] = false; // saveFolderStatus scala klucze, nie usuwa ich
+                    }
+                }
+            }
         } else {
             uint32_t remoteUidnext = remoteStatus.uidNext();
             uint32_t localUidnext = lsNumberOr<uint32_t>(localStatus, LS_UIDNEXT, 0);
@@ -536,7 +570,9 @@ bool SyncWorker::syncNow()
         // Update cache metrics and cleanup bodies we don't want anymore.
         // these queries are expensive so we do this infrequently and increment
         // blindly as we download bodies.
-        time_t lastCleanup = localStatus.count(LS_LAST_CLEANUP) ? localStatus[LS_LAST_CLEANUP].get<time_t>() : 0;
+        // #327: null w statusie folderu rzucał type_error.302 PRZED zapisem statusu,
+        // przez co folder (np. Wysłane) wracał co cykl do tych samych zmian.
+        time_t lastCleanup = lsNumberOr<time_t>(localStatus, LS_LAST_CLEANUP, 0);
         if (syncedMinUID == 1 && (time(0) - lastCleanup > CACHE_CLEANUP_INTERVAL)) {
             cleanMessageCache(*folder);
             localStatus[LS_LAST_CLEANUP] = time(0);
@@ -733,7 +769,7 @@ vector<shared_ptr<Folder>> SyncWorker::syncFoldersAndLabels()
     return foldersToSync;
 }
 
-void SyncWorker::syncFolderUIDRange(Folder & folder, Range range, bool heavyInitialRequest, vector<shared_ptr<Message>> * syncedMessages)
+bool SyncWorker::syncFolderUIDRange(Folder & folder, Range range, bool heavyInitialRequest, vector<shared_ptr<Message>> * syncedMessages)
 {
     std::string remotePath = folder.path();
     
@@ -857,6 +893,29 @@ void SyncWorker::syncFolderUIDRange(Folder & folder, Range range, bool heavyInit
             processor->unlinkMessagesMatchingQuery(query, unlinkPhase);
         }
     }
+
+    // #327: brakujących było więcej niż jedna partia nagłówków — reszta w kolejnym przebiegu.
+    return heavyNeededIdeal > (int)heavyNeeded->count();
+}
+
+int64_t SyncWorker::linkedMessageCount(Folder & folder) {
+    // Wiadomości odłączone mają remoteUID = UINT32_MAX - faza (MailProcessor).
+    Query q = Query().equal("remoteFolderId", folder.id()).lt("remoteUID", (double)(UINT32_MAX - 5));
+    return store->count<Message>(q);
+}
+
+bool SyncWorker::reconcileFolderWithServer(Folder & folder, uint32_t remoteUIDNext) {
+    // Okna po 5000 UID od góry: FETCH flag (lekki), dociągnięcie brakujących
+    // nagłówków (partia do 1024), odłączenie lokalnych, których serwer nie ma.
+    const uint32_t WINDOW = 5000;
+    bool more = false;
+    uint32_t hi = remoteUIDNext > 0 ? remoteUIDNext : 1;
+    while (hi > 1) {
+        uint32_t lo = hi > WINDOW ? hi - WINDOW : 1;
+        more = syncFolderUIDRange(folder, RangeMake(lo, hi - lo), false) || more;
+        hi = lo;
+    }
+    return more;
 }
 
 void SyncWorker::syncFolderChangesViaCondstore(Folder & folder, IMAPFolderStatus & remoteStatus, bool mustSyncAll)
@@ -933,8 +992,24 @@ void SyncWorker::syncFolderChangesViaCondstore(Folder & folder, IMAPFolderStatus
     // range, like 12:* so we can't convert it to a fixed array.
     if (vanished != NULL) {
         vector<Query> queries = MailUtils::queriesForUIDRangesInIndexSet(folder.id(), vanished);
+        // #327 — strażnik: jeśli odłączenie zostawiłoby lokalnie wyraźnie mniej
+        // wiadomości niż ma serwer, NIE odłączamy, tylko wymuszamy pełne
+        // uzgodnienie folderu (lista UID z serwera rozstrzyga, co naprawdę zniknęło).
+        int64_t matched = 0;
         for (Query & query : queries) {
-            processor->unlinkMessagesMatchingQuery(query, unlinkPhase);
+            matched += store->count<Message>(query);
+        }
+        int64_t localN = linkedMessageCount(folder);
+        int64_t remoteN = remoteStatus.messageCount();
+        if (vanishedLooksSuspicious(matched, localN, remoteN)) {
+            logger->error("syncFolderChangesViaCondstore - {}: VANISHED would unlink {} of {} local messages but server has {} — skipping unlink, forcing full reconcile",
+                          folder.path(), matched, localN, remoteN);
+            folder.localStatus()[LS_FORCE_RECONCILE] = true;
+            folder.localStatus()[LS_LAST_RECONCILE_ATTEMPT] = 0;
+        } else {
+            for (Query & query : queries) {
+                processor->unlinkMessagesMatchingQuery(query, unlinkPhase);
+            }
         }
     }
 
@@ -1056,7 +1131,7 @@ bool SyncWorker::syncMessageBodies(Folder & folder, IMAPFolderStatus & remoteSta
     for (auto result : results) {
         // increment local sync state - it's fine if this sometimes fails to save,
         // we recompute the value via COUNT(*) during cleanup
-        ls[LS_BODIES_PRESENT] = ls[LS_BODIES_PRESENT].get<long long>() + 1;
+        ls[LS_BODIES_PRESENT] = lsNumberOr<long long>(ls, LS_BODIES_PRESENT, 0) + 1; // #327: null-safe
 
         // attempt to fetch the message boy
         syncMessageBody(result.get());

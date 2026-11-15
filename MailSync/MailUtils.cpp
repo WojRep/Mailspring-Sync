@@ -10,6 +10,7 @@
 //
 
 #include "MailUtils.hpp"
+#include "UIDReconcile.hpp"
 #include "MetadataExpirationWorker.hpp"
 #include "SyncException.hpp"
 #include "sha256.h"
@@ -465,46 +466,30 @@ shared_ptr<Label> MailUtils::labelForXGMLabelName(string mlname, vector<shared_p
 }
 
 vector<Query> MailUtils::queriesForUIDRangesInIndexSet(string remoteFolderId, IndexSet * set) {
-    vector<Query> results {};
-    vector<uint32_t> uids {};
-    
+    // #327 — plan zakresów w UIDReconcile.hpp (testowany); zakres ograniczony to
+    // `remoteUID >= lo AND remoteUID <= hi` (włącznie). Wcześniej Query gubił
+    // `>=` i zakres odłączał wszystkie wiadomości poniżej górnej granicy.
+    vector<pair<uint64_t, uint64_t>> ranges;
     for (int ii = 0; ii < set->rangesCount(); ii++) {
         uint64_t left = RangeLeftBound(set->allRanges()[ii]);
         uint64_t right = RangeRightBound(set->allRanges()[ii]);
-
         spdlog::get("logger")->info("- Building queries for range {}-{}", left, right);
-
-        if (left == UINT64_MAX) {
-            // an empty range
-            continue;
-        }
-
-        if (left > right) {
-            // an invalid range
+        if (left != UINT64_MAX && left > right) {
             spdlog::get("logger")->error("- IndexSet UID range ({}-{}) has a lower bound greater than it's upper bound.", left, right);
-            continue;
         }
+        ranges.push_back({left, right});
+    }
 
-        if (right == UINT64_MAX) {
-            // this range has a * upper bound, we need to represent it as a "uid > X" query.
-            results.push_back(Query().equal("remoteFolderId", remoteFolderId).gte("remoteUID", left));
-        } else if (right - left > 50) {
-            // this range has many items, just express it as a bounded range query
-            results.push_back(Query().equal("remoteFolderId", remoteFolderId).gte("remoteUID", left).lt("remoteUID", right));
+    vector<Query> results {};
+    for (UIDRangeQuery & spec : planVanishedQueries(ranges, 50)) {
+        if (spec.kind == UIDRangeQuery::Open) {
+            results.push_back(Query().equal("remoteFolderId", remoteFolderId).gte("remoteUID", (double)spec.lo));
+        } else if (spec.kind == UIDRangeQuery::Bounded) {
+            results.push_back(Query().equal("remoteFolderId", remoteFolderId).gte("remoteUID", (double)spec.lo).lte("remoteUID", (double)spec.hi));
         } else {
-            // this range has a few items, throw them in a pile and we'll make a few queries for these specific UIDs
-            for (uint64_t x = left; x <= right; x ++) {
-                uids.push_back((uint32_t)x);
-            }
+            results.push_back(Query().equal("remoteFolderId", remoteFolderId).equal("remoteUID", spec.uids));
         }
     }
-
-    if (uids.size() > 0) {
-        for (vector<uint32_t> chunk : MailUtils::chunksOfVector(uids, 200)) {
-            results.push_back(Query().equal("remoteFolderId", remoteFolderId).equal("remoteUID", chunk));
-        }
-    }
-
     return results;
 }
 

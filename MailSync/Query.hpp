@@ -23,6 +23,7 @@ using namespace std;
 
 class Query {
     json _clauses;
+    Query & _set(const string & col, const string & op, const json & rhs);
     int _limit;
     string _orderBy;
     string _orderDir;
