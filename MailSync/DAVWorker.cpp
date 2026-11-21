@@ -584,14 +584,17 @@ shared_ptr<ContactBook> DAVWorker::resolveAddressBook() {
 
     // Use the .well-known convention to try to look up the root path of the carddav service at the host. If this doesn't
     // work, that's fine with us, we just try the root.
-    string cardRoot = PerformExpectedRedirect("https://" + cardHost + "/.well-known/carddav");
+    // Jak w CalDAV: przekierowanie przyjmujemy wyłącznie na https (DAVAuthPolicy.hpp).
+    string cardRoot = davAcceptWellKnownRedirect(PerformExpectedRedirect("https://" + cardHost + "/.well-known/carddav"));
     if (cardRoot == "") {
-        cardRoot = PerformExpectedRedirect("http://" + cardHost + "/.well-known/carddav");
-        if (cardRoot == "" || cardRoot.find("/.well-known") != string::npos) {
-            // if we couldn't find the root or the redirect looks like it was sending us in a circle,
-            // (or redirecting us to https://) fall back to the root.
-            cardRoot = cardHost + "/";
-        }
+        cardRoot = davAcceptWellKnownRedirect(PerformExpectedRedirect("http://" + cardHost + "/.well-known/carddav"));
+    }
+    if (cardRoot == "" || cardRoot.find("/.well-known") != string::npos) {
+        // if we couldn't find the root or the redirect looks like it was sending us in a circle,
+        // (or redirecting us to https://) fall back to the root.
+        cardRoot = cardHost + "/";
+    } else {
+        admitWellKnownRedirect(cardHost, cardRoot);
     }
     
     if (cardRoot == "https://mail.yahoo.com/") {
@@ -725,15 +728,20 @@ string DAVWorker::discoverCalendarHomeAt(const string & caldavHost) {
         return "";
     }
 
-    // .well-known/caldav redirect to find service root
-    string calRoot = PerformExpectedRedirect("https://" + caldavHost + "/.well-known/caldav");
+    // .well-known/caldav redirect to find service root. PerformExpectedRedirect
+    // nie wysyła żadnych danych logowania. Zapasowe http służy WYŁĄCZNIE do
+    // wykrycia przekierowania — wynik przyjmujemy tylko, gdy to https
+    // (DAVAuthPolicy.hpp), więc dalsze zapytania i tak idą szyfrowane.
+    string calRoot = davAcceptWellKnownRedirect(PerformExpectedRedirect("https://" + caldavHost + "/.well-known/caldav"));
     if (calRoot == "") {
-        calRoot = PerformExpectedRedirect("http://" + caldavHost + "/.well-known/caldav");
+        calRoot = davAcceptWellKnownRedirect(PerformExpectedRedirect("http://" + caldavHost + "/.well-known/caldav"));
     }
     if (calRoot == "" || calRoot.find("/.well-known") != string::npos) {
         // Include scheme so that replacePath() and performXMLRequest() receive a
         // consistent full URL regardless of which branch was taken above.
         calRoot = "https://" + caldavHost + "/";
+    } else {
+        admitWellKnownRedirect(caldavHost, calRoot);
     }
 
     // PROPFIND root → current-user-principal (RFC 5397)
@@ -2180,35 +2188,87 @@ bool DAVWorker::runForCalendarWithSyncToken(string calendarId, string url, share
     return true;
 }
 
-// HTTP Protocol Quirk: WWW-Authenticate Header Parsing
-// Many servers format WWW-Authenticate headers inconsistently with variations in comma
-// placement, case (Basic vs BASIC vs basic), newlines, and parameter formatting. The
-// Python caldav library handles this with robust parsing that normalizes headers.
-// We bypass this issue entirely by using pre-authentication - we send the Authorization
-// header with every request rather than waiting for a 401 challenge and parsing
-// WWW-Authenticate. This is more efficient (avoids an extra round-trip) and sidesteps
-// all server-specific header formatting quirks.
-const string DAVWorker::getAuthorizationHeader() {
+// Kotwice zaufania konta dla hasła IMAP: host IMAP, jawny host CalDAV, hosty
+// ręcznie dodanych kalendarzy (#269). Domena adresu e-mail celowo NIE jest kotwicą.
+set<string> DAVWorker::accountAnchorHosts() {
+    string imapHost, caldavHost;
+    vector<string> extra;
+    try { imapHost = account->IMAPHost(); } catch (...) {}
+    try { caldavHost = account->CalDAVHost(); } catch (...) {}
+    try { extra = account->CalDAVExtraURLs(); } catch (...) {}
+    return davAnchorHosts(imapHost, caldavHost, extra);
+}
+
+set<string> DAVWorker::imapCredentialHosts() {
+    set<string> out = accountAnchorHosts();
+    out.insert(admittedRedirectHosts.begin(), admittedRedirectHosts.end());
+    return out;
+}
+
+// Przekierowanie https z .well-known na host w tej samej domenie co kotwica konta
+// → ten host może dostać hasło IMAP. Inaczej adres jest używany, ale bez hasła IMAP
+// (jawne dane CalDAV / OAuth idą jak dotąd).
+void DAVWorker::admitWellKnownRedirect(const string & fromHost, const string & redirectURL) {
+    const string target = davURLHost(redirectURL);
+    // Host domeny adresu e-mail nie dostaje hasła IMAP przez przekierowanie,
+    // chyba że sam jest kotwicą (DAVAuthPolicy.hpp).
+    string emailDomain;
+    try {
+        string email = account->emailAddress();
+        size_t at = email.find('@');
+        if (at != string::npos) emailDomain = email.substr(at + 1);
+    } catch (...) {
+    }
+    if (davRedirectTargetTrusted(redirectURL, accountAnchorHosts(), emailDomain)) {
+        admittedRedirectHosts.insert(target);
+        logger->info("DAV: .well-known on {} redirects to {} (same domain as the account's server)", fromHost, target);
+    } else {
+        logger->info("DAV: .well-known on {} redirects to {} outside the account's domain — the mail password will not be sent there", fromHost, target);
+    }
+}
+
+// Dawniej: pre-autoryzacja — nagłówek z hasłem doklejany z góry do KAŻDEGO
+// zapytania, także po http i do serwera WWW domeny e-mail (audyt 2026-11-16).
+// Teraz decyzję podejmuje DAVAuthPolicy.hpp dla konkretnego adresu, a
+// performWithDAVAuth wysyła nagłówek dopiero po 401. WWW-Authenticate dalej nie
+// parsujemy (serwery formatują go niespójnie) — 401 po https z hosta, któremu
+// wolno dać dane, wystarcza jako wyzwanie.
+const string DAVWorker::getAuthorizationHeader(const string & url) {
     // #268: serwer kalendarza bywa inny niż serwer poczty i wymaga osobnego
     // loginu — jeśli użytkownik podał poświadczenia DAV, mają pierwszeństwo.
     // Dotyczy też CardDAV: te same poświadczenia obsługują zwykle oba protokoły
     // na tym samym serwerze.
-    const string davUser = account->CalDAVUsername();
-    const string davPass = account->CalDAVPassword();
-    if (davUser != "" && davPass != "") {
-        string davPlain = davUser + ":" + davPass;
-        string davEncoded = MailUtils::toBase64(davPlain.c_str(), strlen(davPlain.c_str()));
-        return "Authorization: Basic " + davEncoded;
-    }
+    DAVCredentials c;
+    c.davUser = account->CalDAVUsername();
+    c.davPass = account->CalDAVPassword();
+    c.oauth = account->refreshToken() != "";
+    c.imapUser = account->IMAPUsername();
+    c.imapPass = account->IMAPPassword();
+    return davAuthorizationHeader(url, c, imapCredentialHosts(), [this]() {
+        return SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+    });
+}
 
-    if (account->refreshToken() != "") {
-        auto parts = SharedXOAuth2TokenManager()->partsForAccount(account);
-        return "Authorization: Bearer " + parts.accessToken;
+string DAVWorker::performWithDAVAuth(const string & url, const function<string(const string & authHeader)> & attempt) {
+    const string host = davURLHost(url);
+    const string auth = getAuthorizationHeader(url);
+    if (auth.empty()) {
+        if (!credentialsWithheldLogged.count(host)) {
+            credentialsWithheldLogged.insert(host);
+            logger->info("DAV: no credentials will be sent to {} (not https, or not a server trusted for this account)", host);
+        }
+        return attempt("");
     }
-
-    string plain = account->IMAPUsername() + ":" + account->IMAPPassword();
-    string encoded = MailUtils::toBase64(plain.c_str(), strlen(plain.c_str()));
-    return "Authorization: Basic " + encoded;
+    if (authChallengedHosts.count(host)) {
+        return attempt(auth);
+    }
+    try {
+        return attempt("");
+    } catch (SyncException & e) {
+        if (e.key != "Invalid Response Code: 401") throw;
+        authChallengedHosts.insert(host);
+        return attempt(auth);
+    }
 }
 
 shared_ptr<DavXML> DAVWorker::performXMLRequest(string _url, string method, string payload, string depth) {
@@ -2227,32 +2287,37 @@ shared_ptr<DavXML> DAVWorker::performXMLRequest(string _url, string method, stri
     //   curl_easy_setopt(curl_handle, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
     // for detected Baikal servers (hostname containing "baikal").
 
-    struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, getAuthorizationHeader().c_str());
-    headers = curl_slist_append(headers, "Prefer: return-minimal");
-    headers = curl_slist_append(headers, "Content-Type: application/xml; charset=utf-8");
-    // Note: Do NOT set Accept: text/vcard here. WebDAV REPORT/PROPFIND responses are always
-    // XML (207 Multi-Status). Setting Accept: text/vcard confuses some servers into returning
-    // raw vCard text or an empty multistatus instead of the expected XML response. The vCard
-    // format preference for embedded carddav:address-data should be set via XML request body
-    // attributes, not via the HTTP Accept header.
     string depthHeader = "Depth: " + depth;
-    headers = curl_slist_append(headers, depthHeader.c_str());
+    auto attempt = [&](const string & authHeader) {
+        struct curl_slist *headers = NULL;
+        if (!authHeader.empty()) {
+            headers = curl_slist_append(headers, authHeader.c_str());
+        }
+        headers = curl_slist_append(headers, "Prefer: return-minimal");
+        headers = curl_slist_append(headers, "Content-Type: application/xml; charset=utf-8");
+        // Note: Do NOT set Accept: text/vcard here. WebDAV REPORT/PROPFIND responses are always
+        // XML (207 Multi-Status). Setting Accept: text/vcard confuses some servers into returning
+        // raw vCard text or an empty multistatus instead of the expected XML response. The vCard
+        // format preference for embedded carddav:address-data should be set via XML request body
+        // attributes, not via the HTTP Accept header.
+        headers = curl_slist_append(headers, depthHeader.c_str());
 
-    CURL * curl_handle = curl_easy_init();
-    const char * payloadChars = payload.c_str();
-    curl_easy_setopt(curl_handle, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 40);
-    curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, method.c_str());
-    curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, payloadChars);
+        CURL * curl_handle = curl_easy_init();
+        const char * payloadChars = payload.c_str();
+        curl_easy_setopt(curl_handle, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 40);
+        curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, method.c_str());
+        curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, payloadChars);
 
-    // Capture response headers for Retry-After extraction
-    capturedHeaders.clear();
-    curl_easy_setopt(curl_handle, CURLOPT_HEADERFUNCTION, headerCallback);
+        // Capture response headers for Retry-After extraction
+        capturedHeaders.clear();
+        curl_easy_setopt(curl_handle, CURLOPT_HEADERFUNCTION, headerCallback);
+        return PerformRequest(curl_handle);
+    };
 
     try {
-        string result = PerformRequest(curl_handle);
+        string result = performWithDAVAuth(url, attempt);
         recordRequestSuccess();
         return make_shared<DavXML>(result, url);
     } catch (const SyncException& e) {
@@ -2270,52 +2335,56 @@ shared_ptr<DavXML> DAVWorker::performXMLRequest(string _url, string method, stri
 string DAVWorker::performVCardRequest(string _url, string method, string vcard, ETAG existingEtag) {
     string url = _url.find("http") != 0 ? "https://" + _url : _url;
     
-    struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, getAuthorizationHeader().c_str());
-    headers = curl_slist_append(headers, "Content-Type: text/vcard; charset=utf-8");
-    headers = curl_slist_append(headers, "Accept: text/vcard; version=4.0");
-    if (existingEtag != "") {
-        string etagHeader = "If-Match: " + existingEtag;
-        headers = curl_slist_append(headers, etagHeader.c_str());
-    }
-
-    CURL * curl_handle = curl_easy_init();
-    const char * payloadChars = vcard.c_str();
-    curl_easy_setopt(curl_handle, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 40);
-    curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, method.c_str());
-    curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, payloadChars);
-    
     logger->info("{}: {} {}", _url, vcard, existingEtag);
-    string result = PerformRequest(curl_handle);
-    return result;
+    return performWithDAVAuth(url, [&](const string & authHeader) {
+        struct curl_slist *headers = NULL;
+        if (!authHeader.empty()) {
+            headers = curl_slist_append(headers, authHeader.c_str());
+        }
+        headers = curl_slist_append(headers, "Content-Type: text/vcard; charset=utf-8");
+        headers = curl_slist_append(headers, "Accept: text/vcard; version=4.0");
+        string etagHeader = "If-Match: " + existingEtag;
+        if (existingEtag != "") {
+            headers = curl_slist_append(headers, etagHeader.c_str());
+        }
+
+        CURL * curl_handle = curl_easy_init();
+        const char * payloadChars = vcard.c_str();
+        curl_easy_setopt(curl_handle, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 40);
+        curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, method.c_str());
+        curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, payloadChars);
+        return PerformRequest(curl_handle);
+    });
 }
 
 string DAVWorker::performICSRequest(string _url, string method, string icsData, ETAG existingEtag) {
     string url = _url.find("http") != 0 ? "https://" + _url : _url;
 
-    struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, getAuthorizationHeader().c_str());
-    headers = curl_slist_append(headers, "Content-Type: text/calendar; charset=utf-8");
+    logger->info("performICSRequest: {} {} etag:{}, data: {}", method, _url, existingEtag, icsData);
+    return performWithDAVAuth(url, [&](const string & authHeader) {
+        struct curl_slist *headers = NULL;
+        if (!authHeader.empty()) {
+            headers = curl_slist_append(headers, authHeader.c_str());
+        }
+        headers = curl_slist_append(headers, "Content-Type: text/calendar; charset=utf-8");
 
-    if (existingEtag != "") {
         // For updates, use If-Match to ensure we don't overwrite concurrent changes
         string etagHeader = "If-Match: " + existingEtag;
-        headers = curl_slist_append(headers, etagHeader.c_str());
-    }
+        if (existingEtag != "") {
+            headers = curl_slist_append(headers, etagHeader.c_str());
+        }
 
-    CURL * curl_handle = curl_easy_init();
-    const char * payloadChars = icsData.c_str();
-    curl_easy_setopt(curl_handle, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 40);
-    curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, method.c_str());
-    curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, payloadChars);
-
-    logger->info("performICSRequest: {} {} etag:{}, data: {}", method, _url, existingEtag, icsData);
-    string result = PerformRequest(curl_handle);
-    return result;
+        CURL * curl_handle = curl_easy_init();
+        const char * payloadChars = icsData.c_str();
+        curl_easy_setopt(curl_handle, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 40);
+        curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, method.c_str());
+        curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, payloadChars);
+        return PerformRequest(curl_handle);
+    });
 }
 
 void DAVWorker::writeAndResyncEvent(shared_ptr<Event> event) {

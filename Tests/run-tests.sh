@@ -51,4 +51,8 @@ echo "== uid-reconcile-test (#327)"
 clang++ "${CXXFLAGS[@]}" "$ROOT/Tests/uid-reconcile-test.cpp" -o "$OUT/uid-reconcile-test" \
   && "$OUT/uid-reconcile-test" || status=1
 
+echo "== dav-auth-policy-test (bezpieczeństwo poświadczeń CalDAV)"
+clang++ "${CXXFLAGS[@]}" "$ROOT/Tests/dav-auth-policy-test.cpp" -o "$OUT/dav-auth-policy-test" \
+  && "$OUT/dav-auth-policy-test" || status=1
+
 exit $status

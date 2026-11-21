@@ -19,10 +19,13 @@
 #include "DavXML.hpp"
 #include "Event.hpp"
 #include "Calendar.hpp"
+#include "DAVAuthPolicy.hpp"
 
 #include <stdio.h>
 
+#include <functional>
 #include <iostream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -62,6 +65,24 @@ class DAVWorker {
     void recordRateLimitResponse(int httpCode, const string& retryAfter);
     int parseRetryAfter(const string& retryAfter);
 
+    // Bezpieczeństwo poświadczeń (DAVAuthPolicy.hpp):
+    // - hosty celów przekierowań https z .well-known przyjęte jako zaufane
+    //   dla hasła IMAP (ta sama domena co host IMAP lub jawne ustawienie);
+    // - hosty, które po https odpowiedziały 401 — dopiero tym wysyłamy
+    //   nagłówek Authorization od razu (bez ponownej rundy bez danych);
+    // - hosty, o których już zalogowaliśmy wstrzymanie danych (bez spamu w logu).
+    set<string> admittedRedirectHosts;
+    set<string> authChallengedHosts;
+    set<string> credentialsWithheldLogged;
+
+    set<string> accountAnchorHosts();
+    set<string> imapCredentialHosts();
+    void admitWellKnownRedirect(const string & fromHost, const string & redirectURL);
+    // Najpierw zapytanie bez danych; Authorization dopiero po 401 z tego samego
+    // hosta po https (i tylko gdy polityka na to pozwala). `attempt` dostaje
+    // pełny nagłówek albo "" i musi zbudować świeże zapytanie curl.
+    string performWithDAVAuth(const string & url, const function<string(const string & authHeader)> & attempt);
+
 public:
     shared_ptr<Account> account;
 
@@ -74,7 +95,9 @@ public:
 
     // #267: kandydaci na host CalDAV, w kolejności prób — jawne ustawienie
     // konta, domena adresu e-mail (RFC 6764), host IMAP. Bez usług trzecich:
-    // odpytujemy wyłącznie serwer użytkownika.
+    // odpytujemy wyłącznie serwer użytkownika. Domena adresu e-mail NIE dostaje
+    // hasła IMAP (DAVAuthPolicy.hpp) — tylko jej przekierowanie https w tej
+    // samej domenie co host IMAP może zostać uznane za zaufane.
     vector<string> calendarHostCandidates();
     // Pełny łańcuch discovery na JEDNYM hoście: .well-known/caldav →
     // current-user-principal (RFC 5397) → calendar-home-set (RFC 4791 §6.2.1).
@@ -109,7 +132,9 @@ public:
     void writeAndResyncEvent(shared_ptr<Event> event);
     void deleteEvent(shared_ptr<Event> event);
 
-    const string getAuthorizationHeader();
+    // Nagłówek Authorization dla KONKRETNEGO adresu albo "" gdy nie wolno
+    // wysłać żadnych danych (http, albo hasło IMAP do niezaufanego hosta).
+    const string getAuthorizationHeader(const string & url);
 
     shared_ptr<DavXML> performXMLRequest(string path, string method, string payload = "", string depth = "1");
     string performVCardRequest(string _url, string method, string vcard = "", ETAG existingEtag = "");
