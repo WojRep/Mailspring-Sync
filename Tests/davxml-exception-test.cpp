@@ -16,6 +16,9 @@
 #include "DavXML.hpp"
 #include "SyncException.hpp"
 
+#include <cstdlib>
+#include <unistd.h>
+
 static int failures = 0;
 
 static void check(bool ok, const char * name, const string & detail = "") {
@@ -52,9 +55,47 @@ static void testValidMultistatusParses() {
     }
 }
 
+// #275 — zepsuta odpowiedź z kartą vCard: ani debuginfo wyjątku (trafia do logu
+// przez exceptions::logCurrentExceptionWithStackTrace), ani komunikat parsera
+// libxml2 na stderr (strumień silnika trafia do logu aplikacji) nie mogą
+// zawierać fragmentu karty.
+static void testBrokenPayloadDoesNotLeak() {
+    string broken = "<?xml version=\"1.0\"?><d:multistatus xmlns:d=\"DAV:\"><d:response>"
+                    "<c:address-data>BEGIN:VCARD\nFN:Jan Kowalski\nTEL:+48 600 100 200\nEND:VCARD"
+                    "</d:respons></d:multistatus>";
+    char tmpl[] = "/tmp/davxml-stderr-XXXXXX";
+    int fd = mkstemp(tmpl);
+    fflush(stderr);
+    int saved = dup(2);
+    dup2(fd, 2);
+    string debuginfo;
+    try {
+        DavXML doc(broken, "https://dav.example.pl/addressbooks/jan.kowalski/");
+    } catch (SyncException & e) {
+        debuginfo = e.debuginfo;
+    } catch (...) {
+    }
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    lseek(fd, 0, SEEK_SET);
+    string captured;
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) captured.append(buf, (size_t)n);
+    close(fd);
+    unlink(tmpl);
+
+    check(debuginfo.find("Kowalski") == string::npos && debuginfo.find("VCARD") == string::npos,
+          "#275 debuginfo błędu parsowania bez treści odpowiedzi", debuginfo.substr(0, 120));
+    check(captured.find("Kowalski") == string::npos && captured.find("jan.kowalski") == string::npos,
+          "#275 parser nie wypisuje fragmentów odpowiedzi ani URL zasobu na stderr", captured.substr(0, 160));
+}
+
 int main() {
     testHtmlResponseThrowsSyncExceptionByValue();
     testValidMultistatusParses();
+    testBrokenPayloadDoesNotLeak();
     printf("%s (%d failure(s))\n", failures ? "FAILED" : "OK", failures);
     return failures ? 1 : 0;
 }

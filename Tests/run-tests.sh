@@ -59,4 +59,16 @@ echo "== dav-discovery-outcome-test (#341 serwer bez CalDAV)"
 clang++ "${CXXFLAGS[@]}" "$ROOT/Tests/dav-discovery-outcome-test.cpp" -o "$OUT/dav-discovery-outcome-test" \
   && "$OUT/dav-discovery-outcome-test" || status=1
 
+echo "== dav-log-redaction-test (#275 logi DAV bez vCard/ICS/URL/ETag)"
+clang++ "${CXXFLAGS[@]}" "$ROOT/Tests/dav-log-redaction-test.cpp" -o "$OUT/dav-log-redaction-test" \
+  && "$OUT/dav-log-redaction-test" || status=1
+
+echo "== dav-log-guard-test (#275 strażnik: wywołania logu w źródłach DAV)"
+clang++ "${CXXFLAGS[@]}" "$ROOT/Tests/dav-log-guard-test.cpp" -o "$OUT/dav-log-guard-test" \
+  && "$OUT/dav-log-guard-test" "$ROOT/MailSync" || status=1
+
+echo "== carddav-discovery-test (#286 discovery książki adresowej)"
+clang++ "${CXXFLAGS[@]}" "$ROOT/Tests/carddav-discovery-test.cpp" -o "$OUT/carddav-discovery-test" \
+  && "$OUT/carddav-discovery-test" "$ROOT/MailSync" || status=1
+
 exit $status

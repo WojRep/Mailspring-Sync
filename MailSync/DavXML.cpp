@@ -11,6 +11,7 @@
 
 #include "DavXML.hpp"
 #include "SyncException.hpp"
+#include "DAVLogRedaction.hpp"
 
 using namespace std;
 
@@ -24,12 +25,16 @@ DavXML::DavXML(string xml, string url):
     // of Content-Type, and we do the same - we simply attempt to parse whatever the server
     // returns without checking Content-Type first. This pragmatic approach ensures
     // compatibility with non-compliant servers.
-    doc = xmlReadMemory(xml.c_str(), (int)xml.size(), url.c_str(), "utf-8", 0);
+    // #275 — XML_PARSE_NOERROR/NOWARNING: domyślny handler libxml2 wypisuje na
+    // stderr (→ log aplikacji) URL zasobu i fragment odpowiedzi, czyli treść
+    // vCard/ICS. Błąd i tak zgłaszamy niżej wyjątkiem.
+    doc = xmlReadMemory(xml.c_str(), (int)xml.size(), url.c_str(), "utf-8", XML_PARSE_NOERROR | XML_PARSE_NOWARNING);
     if (doc == nullptr) {
         // #267 — przez wartość: wszyscy wywołujący łapią `SyncException &`.
         // Wskaźnik (`throw new`) uciekał do `catch (...)` w main.cpp i ubijał
         // wątek kalendarza i kontaktów, gdy serwer oddał HTML zamiast XML.
-        throw SyncException("Unable to parse CalDav XML", xml, false);
+        // #275 — debuginfo trafia do logu: tylko rozmiar odpowiedzi, nie jej treść.
+        throw SyncException("Unable to parse CalDav XML", "payload " + davRedactPayload(xml), false);
     }
 }
 

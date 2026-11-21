@@ -68,4 +68,73 @@ inline string calDAVDiscoveryStatusName(CalDAVDiscoveryVerdict verdict) {
     }
 }
 
+// ---- #286: discovery CardDAV na tych samych zasadach co CalDAV ---------------
+//
+// CardDAV korzysta z tej samej klasyfikacji (kody kandydatów, 404/405/406 = brak
+// usługi) i tych samych kandydatów hostów. Nazwy wartości enum zostają z #341
+// (NoCalDAV = „serwer nie ma usługi DAV tego rodzaju").
+
+using DAVDiscoveryVerdict = CalDAVDiscoveryVerdict;
+
+/**
+ * Kandydaci na host DAV w kolejności prób (#267, RFC 6764): jawny host z
+ * ustawień konta, domena adresu e-mail, host IMAP. Bez usług trzecich i bez
+ * hostów zaszytych w kodzie — pytamy wyłącznie serwer użytkownika. Duplikaty
+ * (bez względu na wielkość liter) pomijane. To NIE decyduje o hasłach:
+ * domena e-mail dalej nie dostaje hasła IMAP (DAVAuthPolicy.hpp).
+ */
+inline vector<string> davDiscoveryHostCandidates(const string & explicitHost, const string & emailAddress,
+                                                 const string & imapHost) {
+    vector<string> out;
+    auto add = [&out](string h) {
+        size_t a = h.find_first_not_of(" \t\r\n");
+        size_t b = h.find_last_not_of(" \t\r\n");
+        if (a == string::npos) return;
+        h = h.substr(a, b - a + 1);
+        string key = h;
+        for (auto & c : key) c = (char)tolower((unsigned char)c);
+        for (const auto & existing : out) {
+            string e = existing;
+            for (auto & c : e) c = (char)tolower((unsigned char)c);
+            if (e == key) return;
+        }
+        out.push_back(h);
+    };
+    add(explicitHost);
+    size_t at = emailAddress.find('@');
+    if (at != string::npos && at + 1 < emailAddress.size()) {
+        string domain = emailAddress.substr(at + 1);
+        for (auto & c : domain) c = (char)tolower((unsigned char)c);
+        add(domain);
+    }
+    add(imapHost);
+    return out;
+}
+
+inline DAVDiscoveryVerdict classifyDAVDiscovery(const vector<int> & candidateCodes, bool homeSetFound) {
+    return classifyCalDAVDiscovery(candidateCodes, homeSetFound);
+}
+
+/**
+ * Czy discovery jest rozstrzygnięte na czas życia procesu. Tylko awaria sieci
+ * (isOffline) zostawia je otwarte do kolejnego cyklu — każdy inny wynik, także
+ * niepewny, kończy je raz, żeby nie odpytywać serwera bez CardDAV co cykl.
+ */
+inline bool davDiscoveryCompletes(DAVDiscoveryVerdict verdict, bool offline) {
+    (void)verdict;
+    return !offline;
+}
+
+/**
+ * Wybór książki adresowej z addressbook-home-set: zapisana wcześniej (jeśli
+ * serwer dalej ją wystawia) — stabilnie między cyklami; inaczej pierwsza.
+ */
+inline string davPickAddressBook(const vector<string> & addressBookURLs, const string & existingURL) {
+    if (addressBookURLs.empty()) return "";
+    for (const auto & u : addressBookURLs) {
+        if (!existingURL.empty() && u == existingURL) return u;
+    }
+    return addressBookURLs.front();
+}
+
 #endif /* DAVDiscoveryOutcome_hpp */

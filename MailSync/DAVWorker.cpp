@@ -11,6 +11,7 @@
 
 #include "DAVWorker.hpp"
 #include "DAVUtils.hpp"
+#include "DAVLogRedaction.hpp"
 #include "ContactGroup.hpp"
 #include "MailStore.hpp"
 #include "MailStoreTransaction.hpp"
@@ -395,8 +396,23 @@ DAVWorker::DAVWorker(shared_ptr<Account> account) :
 }
 
 void DAVWorker::run() {
-    runContacts();
-    runCalendars();
+    try {
+        // #286 — discovery CardDAV działa teraz dla każdego konta, więc błąd
+        // kontaktów (np. 401 na liście książek) nie może zatrzymać kalendarza:
+        // main.cpp po 401/403 kończy cały wątek kalendarza i kontaktów.
+        try {
+            runContacts();
+        } catch (SyncException & e) {
+            logger->warn("CardDAV: contact sync failed ({}), continuing with calendar sync", e.key);
+        }
+        runCalendars();
+    } catch (SyncException & e) {
+        // #275 — wyjątek trafia do logu w main.cpp (logCurrentExceptionWithStackTrace,
+        // toJSON z debuginfo). Ostatnia linia obrony: bez URL-i zasobów i treści
+        // odpowiedzi; znaczniki decyzyjne (invalid_grant, dailyLimitExceeded) zostają.
+        e.debuginfo = davRedactDebugInfo(e.debuginfo);
+        throw;
+    }
 }
 
 void DAVWorker::runContacts() {
@@ -415,21 +431,21 @@ void DAVWorker::runContacts() {
         try {
             logger->info("Performing full CardDAV address book discovery");
             cachedAddressBook = resolveAddressBook();
-            contactsDiscoveryComplete = true;
+            // #286 — rozstrzygnięte raz na czas życia procesu (bez pętli co cykl).
+            contactsDiscoveryComplete = davDiscoveryCompletes(lastContactsDiscoveryVerdict, false);
             contactsValidationFailures = 0;
         } catch (SyncException & e) {
-            // Handle servers that don't support CardDAV (return 404 Not Found, 405 Method Not Allowed,
-            // or 406 Not Acceptable). Log the error and skip contact sync rather than crashing.
-            if (e.key.find("404") != string::npos || e.key.find("405") != string::npos || e.key.find("406") != string::npos) {
-                logger->info("CardDAV not supported by server ({}), skipping contact sync", e.key);
-                contactsDiscoveryComplete = true;
+            // Awaria sieci (DNS, odmowa połączenia, timeout) — jak w CalDAV: nie
+            // zamykamy discovery na stałe, ponowimy w kolejnym cyklu.
+            if (e.isOffline()) {
+                logger->info("CardDAV server unreachable during discovery ({}), will retry next cycle", e.key);
                 cachedAddressBook = nullptr;
                 return;
             }
-            // Handle network errors during discovery (DNS resolution failure, connection refused, etc.)
-            // These indicate the CardDAV server is unreachable - skip contact sync rather than crashing.
-            if (e.isOffline()) {
-                logger->info("CardDAV server unreachable during discovery ({}), skipping contact sync", e.key);
+            // Serwer odrzucił listę książek na znalezionym home-secie (404/405/406)
+            // — kończymy discovery raz, bez ubijania wątku synchronizacji.
+            if (e.key.find("404") != string::npos || e.key.find("405") != string::npos || e.key.find("406") != string::npos) {
+                logger->info("CardDAV not supported by server ({}), skipping contact sync", e.key);
                 contactsDiscoveryComplete = true;
                 cachedAddressBook = nullptr;
                 return;
@@ -444,10 +460,17 @@ void DAVWorker::runContacts() {
 
     // Subsequent syncs: validate cached URL with lightweight request
     if (!validateCachedAddressBook()) {
-        // Cache invalid, clear and re-discover next cycle
-        logger->info("Cached address book URL invalid, will rediscover on next sync");
         cachedAddressBook = nullptr;
-        contactsDiscoveryComplete = false;
+        if (lastContactsDiscoveryVerdict == DAVDiscoveryVerdict::Found) {
+            // Cache invalid, clear and re-discover next cycle
+            logger->info("Cached address book URL invalid, will rediscover on next sync");
+            contactsDiscoveryComplete = false;
+        } else {
+            // #286 — zapisana książka nie działa, a discovery jej nie potwierdziło:
+            // ponowne discovery co cykl dałoby ten sam wynik (pętla). Kończymy.
+            logger->info("Stored address book URL invalid and discovery found none, skipping contact sync");
+            contactsDiscoveryComplete = true;
+        }
         return;
     }
 
@@ -458,12 +481,12 @@ void DAVWorker::runContacts() {
 
     // Compare old ctag with new ctag from server
     if (oldCtag == newCtag && newCtag != "") {
-        logger->info("Address book unchanged (ctag: {}), skipping sync", newCtag);
+        logger->info("Address book unchanged (ctag: {}), skipping sync", davRedactETag(newCtag));
         return;
     }
 
     if (newCtag != "") {
-        logger->info("Syncing address book (ctag: {} -> {})", oldCtag, newCtag);
+        logger->info("Syncing address book (ctag: {} -> {})", davRedactETag(oldCtag), davRedactETag(newCtag));
     } else {
         logger->info("Syncing address book (server doesn't provide ctag)");
     }
@@ -548,96 +571,166 @@ bool DAVWorker::validateCachedAddressBook() {
 }
 
 /*
- Performs full address book discovery via DNS SRV + .well-known + PROPFIND chain.
- Currently we load whatever contact book we have saved locally, but still re-run the DNS + well-known
- search to see if we need to update it's URL since users have no way to do this manually.
+ #286: discovery książki adresowej CardDAV — ta sama droga co CalDAV (#267/#341).
+
+ WS2-F usunęło zapytanie do usługi upstream (/api/resolve-dav-hosts wysyłało
+ domenę i host IMAP użytkownika poza jego serwer), ale zostawiło
+ `string cardHost = ""` zaszyte na sztywno: discovery kończyło się przed
+ pierwszym zapytaniem dla każdego konta poza Gmailem, choć log pisał
+ „Performing full CardDAV address book discovery". Kontakty nie synchronizowały się.
+
+ Teraz: kandydaci hostów z konta (addressBookHostCandidates — bez usług
+ trzecich), na każdym .well-known/carddav → current-user-principal (RFC 5397)
+ → addressbook-home-set (RFC 6352 §7.1.1), potem lista książek adresowych.
+ Kody kandydatów klasyfikuje DAVDiscoveryOutcome.hpp: same 404/405/406 = serwer
+ nie ma CardDAV. Poświadczenia — wyłącznie wg DAVAuthPolicy.hpp (performXMLRequest).
+ DNS SRV (RFC 6764 §3) nie jest odpytywany — tak samo jak w CalDAV.
+
+ Rzuca SyncException tylko przy awarii sieci (isOffline) albo błędzie listy
+ książek na znalezionym home-secie; runContacts() decyduje, co dalej.
 */
-shared_ptr<ContactBook> DAVWorker::resolveAddressBook() {
-    shared_ptr<ContactBook> existing = store->find<ContactBook>(Query().equal("accountId", account->id()));
-    if (existing && existing->source() != CARDDAV_SYNC_SOURCE) {
-        return nullptr;
-    }
-    
-    string cardHost = "";
+vector<string> DAVWorker::addressBookHostCandidates() {
+    // Ci sami kandydaci co dla CalDAV: jawny host DAV z ustawień konta
+    // (caldav_host — „jawny host CalDAV/CardDAV", Account.hpp), domena adresu
+    // e-mail (RFC 6764), host IMAP.
+    return calendarHostCandidates();
+}
 
-    // WS2-F (Actuna Mail): Foundry's /api/resolve-dav-hosts is the one
-    // backend endpoint that fired even without a Mailspring identity
-    // (analysis/06 D4). It posted {domain, imapHost} of the user's
-    // account to id.getmailspring.com. Skipped here. Users wanting
-    // CardDAV/CalDAV must configure host explicitly in Account
-    // settings; auto-discovery via Foundry is not used.
-    //
-    // Upstream behaviour for reference:
-    //   string domain = account->emailAddress().substr(...);
-    //   string imapHost = account->IMAPHost();
-    //   json payload = {{"domain", domain}, {"imapHost", imapHost}};
-    //   json result = PerformJSONRequest(CreateIdentityRequest(
-    //       "/api/resolve-dav-hosts", "POST", payload.dump().c_str()));
-    //
-    // The CreateIdentityRequest call would now throw on empty
-    // IDENTITY_SERVER (WS2-F NetworkRequestUtils patch), but we skip
-    // the call site explicitly so we don't pollute the log with
-    // SyncException entries on every account add.
-    if (cardHost == "") {
-        // No discovery; fall through to existing or null.
-        return existing;
+string DAVWorker::discoverAddressBookHomeAt(const string & cardHost) {
+    if (cardHost.empty()) {
+        return "";
     }
 
-    // Use the .well-known convention to try to look up the root path of the carddav service at the host. If this doesn't
-    // work, that's fine with us, we just try the root.
-    // Jak w CalDAV: przekierowanie przyjmujemy wyłącznie na https (DAVAuthPolicy.hpp).
+    // .well-known/carddav — PerformExpectedRedirect nie wysyła danych logowania;
+    // wynik przyjmujemy wyłącznie, gdy to https (DAVAuthPolicy.hpp).
     string cardRoot = davAcceptWellKnownRedirect(PerformExpectedRedirect("https://" + cardHost + "/.well-known/carddav"));
     if (cardRoot == "") {
         cardRoot = davAcceptWellKnownRedirect(PerformExpectedRedirect("http://" + cardHost + "/.well-known/carddav"));
     }
     if (cardRoot == "" || cardRoot.find("/.well-known") != string::npos) {
-        // if we couldn't find the root or the redirect looks like it was sending us in a circle,
-        // (or redirecting us to https://) fall back to the root.
-        cardRoot = cardHost + "/";
+        // Brak przekierowania albo przekierowanie w kółko — pytamy korzeń hosta.
+        cardRoot = "https://" + cardHost + "/";
     } else {
         admitWellKnownRedirect(cardHost, cardRoot);
     }
-    
+
     if (cardRoot == "https://mail.yahoo.com/") {
-        // workaound yahoo second redirect above sending us to mail.yahoo.com...
-        return existing;
+        // Obejście z upstream: .well-known Yahoo przekierowuje na serwis WWW
+        // poczty, który nie jest serwerem CardDAV. To nie jest host discovery,
+        // tylko ochrona przed PROPFIND-em w złe miejsce.
+        return "";
     }
-    
-    // Fetch the current user principal URL from the CardDav root
-    auto principalDoc = performXMLRequest(cardRoot, "PROPFIND", "<?xml version=\"1.0\" encoding=\"UTF-8\"?><A:propfind xmlns:A=\"DAV:\"><A:prop><A:current-user-principal/><A:principal-URL/><A:resourcetype/></A:prop></A:propfind>");
+
+    // PROPFIND korzeń → current-user-principal (RFC 5397)
+    auto principalDoc = performXMLRequest(cardRoot, "PROPFIND",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<A:propfind xmlns:A=\"DAV:\"><A:prop>"
+        "<A:current-user-principal/><A:principal-URL/><A:resourcetype/>"
+        "</A:prop></A:propfind>");
     string cardPrincipal = principalDoc->nodeContentAtXPath("//D:current-user-principal/D:href/text()");
+    if (cardPrincipal.empty()) {
+        logger->info("CardDAV: server returned no current-user-principal on host {}", cardHost);
+        return "";
+    }
     if (cardPrincipal.find("://") == string::npos) {
         cardPrincipal = replacePath(cardRoot, cardPrincipal);
     }
-    
-    // Fetch the address book home set URL from the user principal URL
-    auto abSetDoc = performXMLRequest(cardPrincipal, "PROPFIND", "<?xml version=\"1.0\" encoding=\"UTF-8\"?><A:propfind xmlns:A=\"DAV:\"><A:prop><A:displayname/><A:resourcetype/><B:addressbook-home-set xmlns:B=\"urn:ietf:params:xml:ns:carddav\"/></A:prop></A:propfind>");
-    auto abSetURL = abSetDoc->nodeContentAtXPath("//carddav:addressbook-home-set/D:href/text()");
+
+    // PROPFIND principal → addressbook-home-set (RFC 6352 §7.1.1)
+    auto abSetDoc = performXMLRequest(cardPrincipal, "PROPFIND",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<A:propfind xmlns:A=\"DAV:\"><A:prop><A:displayname/><A:resourcetype/>"
+        "<B:addressbook-home-set xmlns:B=\"urn:ietf:params:xml:ns:carddav\"/>"
+        "</A:prop></A:propfind>");
+    string abSetURL = abSetDoc->nodeContentAtXPath("//carddav:addressbook-home-set/D:href/text()");
+    if (abSetURL.empty()) {
+        logger->info("CardDAV: server returned no addressbook-home-set on host {}", cardHost);
+        return "";
+    }
     if (abSetURL.find("://") == string::npos) {
         abSetURL = replacePath(cardRoot, abSetURL);
     }
-    
-    // Hit the home address book set to retrieve the individual address books (including ctag)
-    auto abSetContentsDoc = performXMLRequest(abSetURL, "PROPFIND", "<?xml version=\"1.0\" encoding=\"UTF-8\"?><d:propfind xmlns:d=\"DAV:\" xmlns:cs=\"http://calendarserver.org/ns/\"><d:prop><d:resourcetype /><d:displayname /><cs:getctag /></d:prop></d:propfind>");
+    return abSetURL;
+}
 
-    // Iterate over the address books and run a sync on each one
-    // TODO: Pick the primary one somehow!
+shared_ptr<ContactBook> DAVWorker::resolveAddressBook() {
+    lastContactsDiscoveryVerdict = DAVDiscoveryVerdict::Inconclusive;
+    shared_ptr<ContactBook> existing = store->find<ContactBook>(Query().equal("accountId", account->id()));
+    if (existing && existing->source() != CARDDAV_SYNC_SOURCE) {
+        return nullptr;
+    }
 
+    vector<string> candidates = addressBookHostCandidates();
+    if (candidates.empty()) {
+        logger->info("CardDAV: no candidate host for discovery, skipping contact sync");
+        return existing;
+    }
+
+    vector<int> candidateCodes;
+    string abSetURL = "";
+    for (const string & host : candidates) {
+        try {
+            abSetURL = discoverAddressBookHomeAt(host);
+            if (!abSetURL.empty()) {
+                logger->info("CardDAV: address book home-set discovered via host {}", host);
+                break;
+            }
+            // Odpowiedź bez wyjątku = poprawny XML DAV, tylko bez principal/home-set.
+            candidateCodes.push_back(207);
+            logger->info("CardDAV: host {} did not yield an address book home-set", host);
+        } catch (SyncException & e) {
+            // Awaria sieci — przejściowa; runContacts() ponowi w kolejnym cyklu.
+            if (e.isOffline()) throw;
+            candidateCodes.push_back(davHTTPCodeFromErrorKey(e.key));
+            logger->info("CardDAV: discovery on host {} failed ({}), trying next", host, e.key);
+        }
+    }
+
+    lastContactsDiscoveryVerdict = classifyDAVDiscovery(candidateCodes, !abSetURL.empty());
+    if (abSetURL.empty()) {
+        if (lastContactsDiscoveryVerdict == DAVDiscoveryVerdict::NoCalDAV) {
+            logger->info("CardDAV: server does not provide CardDAV (all {} candidate host(s) answered 404/405/406)", candidates.size());
+        } else {
+            logger->info("CardDAV: no address book home-set found (tried {} candidate host(s))", candidates.size());
+        }
+        // Zapisana wcześniej książka (np. sprzed WS2-F) może dalej działać —
+        // sprawdzi ją validateCachedAddressBook(); bez pętli (runContacts()).
+        return existing;
+    }
+
+    // Home-set → lista książek adresowych (z ctag).
+    auto abSetContentsDoc = performXMLRequest(abSetURL, "PROPFIND",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<d:propfind xmlns:d=\"DAV:\" xmlns:cs=\"http://calendarserver.org/ns/\">"
+        "<d:prop><d:resourcetype /><d:displayname /><cs:getctag /></d:prop></d:propfind>");
+
+    vector<string> abURLs;
+    map<string, string> abCtags;
     abSetContentsDoc->evaluateXPath("//D:response[.//carddav:addressbook]", ([&](xmlNodePtr node) {
         string abHREF = abSetContentsDoc->nodeContentAtXPath(".//D:href/text()", node);
+        if (abHREF.empty()) return;
         string abURL = (abHREF.find("://") == string::npos) ? replacePath(abSetURL, abHREF) : abHREF;
-        string ctag = abSetContentsDoc->nodeContentAtXPath(".//cs:getctag/text()", node);
-        if (!existing) {
-            existing = make_shared<ContactBook>(account->id() + "-default", account->id());
-        }
-        existing->setSource("carddav");
-        existing->setURL(abURL);
-        // Save without ctag - ctag is only persisted after a successful sync.
-        // (Setting it here would cause the first sync to see oldCtag == newCtag and skip.)
-        store->save(existing.get());
-        existing->setCtag(ctag); // set in-memory for comparison, not yet in DB
+        abURLs.push_back(abURL);
+        abCtags[abURL] = abSetContentsDoc->nodeContentAtXPath(".//cs:getctag/text()", node);
     }));
 
+    // Jedna książka na konto (ContactBook "<account>-default"): zapisana wcześniej,
+    // jeśli serwer dalej ją wystawia, inaczej pierwsza (DAVDiscoveryOutcome.hpp).
+    string chosen = davPickAddressBook(abURLs, existing ? existing->url() : "");
+    if (chosen.empty()) {
+        logger->info("CardDAV: address book home-set lists no address books");
+        return existing;
+    }
+    if (!existing) {
+        existing = make_shared<ContactBook>(account->id() + "-default", account->id());
+    }
+    existing->setSource("carddav");
+    existing->setURL(chosen);
+    // Save without ctag - ctag is only persisted after a successful sync.
+    // (Setting it here would cause the first sync to see oldCtag == newCtag and skip.)
+    store->save(existing.get());
+    existing->setCtag(abCtags[chosen]); // set in-memory for comparison, not yet in DB
+    logger->info("CardDAV: using address book {} ({} available)", davRedactURL(chosen), abURLs.size());
     return existing;
 }
 
@@ -662,39 +755,12 @@ shared_ptr<ContactBook> DAVWorker::resolveAddressBook() {
  zgodnie z RFC 6764. Żadnych usług trzecich.
 */
 vector<string> DAVWorker::calendarHostCandidates() {
-    vector<string> out;
-    auto add = [&out](const string & h) {
-        if (h.empty()) return;
-        for (const auto & existing : out) {
-            if (existing == h) return;
-        }
-        out.push_back(h);
-    };
-
-    // 1. Jawne ustawienie konta — zawsze wygrywa.
-    try {
-        add(account->CalDAVHost());
-    } catch (...) {
-        // brak klucza w settings — nie szkodzi
-    }
-
-    // 2. Domena adresu e-mail — kanoniczny punkt startowy RFC 6764.
-    try {
-        string email = account->emailAddress();
-        size_t at = email.find('@');
-        if (at != string::npos && at + 1 < email.size()) {
-            add(email.substr(at + 1));
-        }
-    } catch (...) {
-    }
-
-    // 3. Host IMAP — w małych wdrożeniach ten sam serwer obsługuje pocztę i DAV.
-    try {
-        add(account->IMAPHost());
-    } catch (...) {
-    }
-
-    return out;
+    // Kolejność i zasady: DAVDiscoveryOutcome.hpp (davDiscoveryHostCandidates).
+    string explicitHost, email, imapHost;
+    try { explicitHost = account->CalDAVHost(); } catch (...) {} // brak klucza w settings — nie szkodzi
+    try { email = account->emailAddress(); } catch (...) {}
+    try { imapHost = account->IMAPHost(); } catch (...) {}
+    return davDiscoveryHostCandidates(explicitHost, email, imapHost);
 }
 
 string DAVWorker::resolveCalendarHomeURL() {
@@ -859,7 +925,7 @@ void DAVWorker::writeAndResyncContact(shared_ptr<Contact> contact) {
             if (isGroup) {
                 rebuildContactGroup(serverside);
             }
-            logger->info("Contact ETAG is now {}", serverside->etag());
+            logger->info("Contact ETAG is now {}", davRedactETag(serverside->etag()));
             store->save(serverside.get());
             
             // If the server re-assigned the contact a new ID / UID (FastMail),
@@ -945,7 +1011,7 @@ void DAVWorker::runForAddressBook(shared_ptr<ContactBook> ab) {
     // by now, but it appears to work for me.
     std::reverse(needed.begin(), needed.end());
     if (deleted.size() || needed.size()) {
-        logger->info("{}", ab->url());
+        logger->info("{}", davRedactURL(ab->url()));
         logger->info("  remote: {} etags", remote.size());
         logger->info("   local: {} etags", local.size());
         logger->info(" deleted: {}", deleted.size());
@@ -1287,13 +1353,13 @@ shared_ptr<Contact> DAVWorker::ingestAddressDataNode(shared_ptr<DavXML> doc, xml
     auto href = doc->nodeContentAtXPath(".//D:href/text()", node);
     auto vcardString = doc->nodeContentAtXPath(".//carddav:address-data/text()", node);
     if (vcardString == "") {
-        logger->info("Received addressbook entry {} with an empty body", etag);
+        logger->info("Received addressbook entry {} with an empty body", davRedactETag(etag));
         return nullptr;
     }
     
     auto vcard = make_shared<VCard>(vcardString);
     if (vcard->incomplete()) {
-        logger->info("Unable to decode vcard: {}", vcardString);
+        logger->info("Unable to decode vcard ({})", davRedactPayload(vcardString));
         return nullptr;
     }
     string id = vcard->getUniqueId()->getValue();
@@ -1391,18 +1457,18 @@ void DAVWorker::runExtraCalendars() {
     for (const string & entry : raw) {
         const string url = normalizedExtraCalendarURL(entry);
         if (url == "") {
-            logger->info("CalDAV: skipping calendar address '{}' — only http/https CalDAV collections are supported", entry);
+            logger->info("CalDAV: skipping calendar address '{}' — only http/https CalDAV collections are supported", davRedactURL(entry));
             continue;
         }
         // Jeden zły adres nie może przewrócić pozostałych ani ubić wątku.
         try {
             runOneExtraCalendar(url);
         } catch (SyncException & e) {
-            logger->info("CalDAV: extra calendar {} failed ({}), skipping", url, e.key);
+            logger->info("CalDAV: extra calendar {} failed ({}), skipping", davRedactURL(url), e.key);
         } catch (std::exception & e) {
-            logger->info("CalDAV: extra calendar {} failed ({}), skipping", url, e.what());
+            logger->info("CalDAV: extra calendar {} failed ({}), skipping", davRedactURL(url), davRedactDebugInfo(e.what()));
         } catch (...) {
-            logger->info("CalDAV: extra calendar {} failed (unknown error), skipping", url);
+            logger->info("CalDAV: extra calendar {} failed (unknown error), skipping", davRedactURL(url));
         }
     }
 }
@@ -1456,7 +1522,9 @@ void DAVWorker::runOneExtraCalendar(const string & url) {
         // pod obcym adresem wyprodukowałaby błędny URL PUT-a.
         calendar->setReadOnly(true);
         store->save(calendar.get());
-        logger->info("CalDAV: added manually configured calendar '{}' ({})", name, url);
+        // #275 — bez displayname nazwą jest adres; do logu tylko jego zredagowana postać.
+        const string logName = (name == url) ? davRedactURL(url) : name;
+        logger->info("CalDAV: added manually configured calendar '{}' ({})", logName, davRedactURL(url));
     } else if (calendar->name() != name && name != url) {
         calendar->setName(name);
         store->save(calendar.get());
@@ -1600,7 +1668,7 @@ void DAVWorker::runCalendars() {
         if (calendar) {
             // Existing calendar - check if ctag changed
             if (calendar->ctag() == ctag && ctag != "") {
-                logger->info("Calendar '{}' unchanged (ctag: {}), skipping sync", name, ctag);
+                logger->info("Calendar '{}' unchanged (ctag: {}), skipping sync", name, davRedactETag(ctag));
                 needsSync = false;
             }
             // Check if metadata changed
@@ -1657,7 +1725,7 @@ void DAVWorker::runCalendars() {
         // sync if needed
         if (needsSync) {
             if (ctag != "") {
-                logger->info("Syncing calendar '{}' (ctag: {} -> {})", name, calendar->ctag(), ctag);
+                logger->info("Syncing calendar '{}' (ctag: {} -> {})", name, davRedactETag(calendar->ctag()), davRedactETag(ctag));
             } else {
                 logger->info("Syncing calendar '{}' (server doesn't provide ctag)", name);
             }
@@ -1780,7 +1848,7 @@ void DAVWorker::runForCalendar(string calendarId, string name, string url) {
     // Request newest events first
     std::reverse(neededHrefs.begin(), neededHrefs.end());
     if (!deletedIcsUIDs.empty() || !neededHrefs.empty()) {
-        logger->info("{} (time range: {} to {})", url, range.startStr, range.endStr);
+        logger->info("{} (time range: {} to {})", davRedactURL(url), range.startStr, range.endStr);
         logger->info("  remote: {} events in range", remote.size());
         logger->info("   local: {} events", local.size());
         logger->info(" removed: {} (deleted or out of range)", deletedIcsUIDs.size());
@@ -1809,7 +1877,7 @@ void DAVWorker::runForCalendar(string calendarId, string name, string url) {
                 // Skip empty responses (Google sometimes returns empty data)
                 if (etag == "" || icsData == "") {
                     if (etag != "") {
-                        logger->info("Received calendar event {} with an empty body", etag);
+                        logger->info("Received calendar event {} with an empty body", davRedactETag(etag));
                     }
                     return;
                 }
@@ -1822,7 +1890,7 @@ void DAVWorker::runForCalendar(string calendarId, string name, string url) {
                 // Process ALL VEVENTs in the ICS file (master + any recurrence exceptions)
                 for (auto icsEvent : cal.Events) {
                     if (icsEvent->DtStart.IsEmpty()) {
-                        logger->info("Received calendar event but it has no start time?\n\n{}\n\n", icsData);
+                        logger->info("Received calendar event but it has no start time ({}, {})", davRedactURL(href), davRedactPayload(icsData));
                         continue;
                     }
 
@@ -2027,7 +2095,7 @@ bool DAVWorker::runForCalendarWithSyncToken(string calendarId, string url, share
     }
 
     logger->info("sync-collection complete ({} pages): {} direct, {} needed, {} deleted, token={}",
-                 pageCount, directData.size(), neededHrefs.size(), deletedHrefs.size(), syncToken);
+                 pageCount, directData.size(), neededHrefs.size(), deletedHrefs.size(), davRedactETag(syncToken));
 
     // Some providers (observed: Yahoo CalDAV) never return a <D:sync-token> in their
     // sync-collection response, so calendar->syncToken() is always empty and isInitialSync
@@ -2291,6 +2359,15 @@ string DAVWorker::performWithDAVAuth(const string & url, const function<string(c
     }
 }
 
+// #275 — debuginfo z NetworkRequestUtils ("<url> RETURNED <body>") trafia do logu
+// i do błędu zadania (TaskProcessor: toJSON). Redagujemy u źródła. Wyjątek: 507 —
+// runFor*WithSyncToken parsuje z debuginfo ucięty multistatus; dla niego ostatnią
+// linią obrony jest DAVWorker::run().
+static void redactDAVException(SyncException & e) {
+    if (e.key.find("507") != string::npos) return;
+    e.debuginfo = davRedactDebugInfo(e.debuginfo);
+}
+
 shared_ptr<DavXML> DAVWorker::performXMLRequest(string _url, string method, string payload, string depth) {
     // Apply rate limiting delay before making request (RFC 6585/7231 compliance)
     applyRateLimitDelay();
@@ -2340,7 +2417,8 @@ shared_ptr<DavXML> DAVWorker::performXMLRequest(string _url, string method, stri
         string result = performWithDAVAuth(url, attempt);
         recordRequestSuccess();
         return make_shared<DavXML>(result, url);
-    } catch (const SyncException& e) {
+    } catch (SyncException& e) {
+        redactDAVException(e);
         // Check if this is a rate limit response (429 or 503)
         // The exception key format is "Invalid Response Code: XXX"
         if (e.key.find("429") != string::npos || e.key.find("503") != string::npos) {
@@ -2355,56 +2433,66 @@ shared_ptr<DavXML> DAVWorker::performXMLRequest(string _url, string method, stri
 string DAVWorker::performVCardRequest(string _url, string method, string vcard, ETAG existingEtag) {
     string url = _url.find("http") != 0 ? "https://" + _url : _url;
     
-    logger->info("{}: {} {}", _url, vcard, existingEtag);
-    return performWithDAVAuth(url, [&](const string & authHeader) {
-        struct curl_slist *headers = NULL;
-        if (!authHeader.empty()) {
-            headers = curl_slist_append(headers, authHeader.c_str());
-        }
-        headers = curl_slist_append(headers, "Content-Type: text/vcard; charset=utf-8");
-        headers = curl_slist_append(headers, "Accept: text/vcard; version=4.0");
-        string etagHeader = "If-Match: " + existingEtag;
-        if (existingEtag != "") {
-            headers = curl_slist_append(headers, etagHeader.c_str());
-        }
+    logger->info("CardDAV {} {} ({}, If-Match {})", method, davRedactURL(_url), davRedactPayload(vcard), davRedactETag(existingEtag));
+    try {
+        return performWithDAVAuth(url, [&](const string & authHeader) {
+            struct curl_slist *headers = NULL;
+            if (!authHeader.empty()) {
+                headers = curl_slist_append(headers, authHeader.c_str());
+            }
+            headers = curl_slist_append(headers, "Content-Type: text/vcard; charset=utf-8");
+            headers = curl_slist_append(headers, "Accept: text/vcard; version=4.0");
+            string etagHeader = "If-Match: " + existingEtag;
+            if (existingEtag != "") {
+                headers = curl_slist_append(headers, etagHeader.c_str());
+            }
 
-        CURL * curl_handle = curl_easy_init();
-        const char * payloadChars = vcard.c_str();
-        curl_easy_setopt(curl_handle, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 40);
-        curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, method.c_str());
-        curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, payloadChars);
-        return PerformRequest(curl_handle);
-    });
+            CURL * curl_handle = curl_easy_init();
+            const char * payloadChars = vcard.c_str();
+            curl_easy_setopt(curl_handle, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 40);
+            curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, method.c_str());
+            curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+            curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, payloadChars);
+            return PerformRequest(curl_handle);
+        });
+    } catch (SyncException & e) {
+        redactDAVException(e);
+        throw;
+    }
 }
 
 string DAVWorker::performICSRequest(string _url, string method, string icsData, ETAG existingEtag) {
     string url = _url.find("http") != 0 ? "https://" + _url : _url;
 
-    logger->info("performICSRequest: {} {} etag:{}, data: {}", method, _url, existingEtag, icsData);
-    return performWithDAVAuth(url, [&](const string & authHeader) {
-        struct curl_slist *headers = NULL;
-        if (!authHeader.empty()) {
-            headers = curl_slist_append(headers, authHeader.c_str());
-        }
-        headers = curl_slist_append(headers, "Content-Type: text/calendar; charset=utf-8");
+    logger->info("CalDAV {} {} ({}, If-Match {})", method, davRedactURL(_url), davRedactPayload(icsData), davRedactETag(existingEtag));
+    try {
+        return performWithDAVAuth(url, [&](const string & authHeader) {
+            struct curl_slist *headers = NULL;
+            if (!authHeader.empty()) {
+                headers = curl_slist_append(headers, authHeader.c_str());
+            }
+            headers = curl_slist_append(headers, "Content-Type: text/calendar; charset=utf-8");
 
-        // For updates, use If-Match to ensure we don't overwrite concurrent changes
-        string etagHeader = "If-Match: " + existingEtag;
-        if (existingEtag != "") {
-            headers = curl_slist_append(headers, etagHeader.c_str());
-        }
+            // For updates, use If-Match to ensure we don't overwrite concurrent changes
+            string etagHeader = "If-Match: " + existingEtag;
+            if (existingEtag != "") {
+                headers = curl_slist_append(headers, etagHeader.c_str());
+            }
 
-        CURL * curl_handle = curl_easy_init();
-        const char * payloadChars = icsData.c_str();
-        curl_easy_setopt(curl_handle, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 40);
-        curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, method.c_str());
-        curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, payloadChars);
-        return PerformRequest(curl_handle);
-    });
+            CURL * curl_handle = curl_easy_init();
+            const char * payloadChars = icsData.c_str();
+            curl_easy_setopt(curl_handle, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 40);
+            curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, method.c_str());
+            curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+            curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, payloadChars);
+            return PerformRequest(curl_handle);
+        });
+    } catch (SyncException & e) {
+        redactDAVException(e);
+        throw;
+    }
 }
 
 void DAVWorker::writeAndResyncEvent(shared_ptr<Event> event) {
@@ -2477,7 +2565,7 @@ void DAVWorker::writeAndResyncEvent(shared_ptr<Event> event) {
                 event->_data["icsuid"] = matchingEvent->UID;
 
                 store->save(event.get());
-                logger->info("Event syncback complete. New etag: {}", newEtag);
+                logger->info("Event syncback complete. New etag: {}", davRedactETag(newEtag));
             }
         } else {
             logger->warn("Event syncback: received empty response from server");
@@ -2511,6 +2599,6 @@ void DAVWorker::deleteEvent(shared_ptr<Event> event) {
 
     // 4. Remove from local database
     store->remove(event.get());
-    logger->info("Event deleted successfully: {}", href);
+    logger->info("Event deleted successfully: {}", davRedactURL(href));
 }
 

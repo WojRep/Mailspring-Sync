@@ -48,6 +48,8 @@ class DAVWorker {
     bool contactsDiscoveryComplete = false;
     shared_ptr<ContactBook> cachedAddressBook = nullptr;
     int contactsValidationFailures = 0;
+    // #286 — werdykt ostatniego resolveAddressBook() (DAVDiscoveryOutcome.hpp).
+    DAVDiscoveryVerdict lastContactsDiscoveryVerdict = DAVDiscoveryVerdict::Inconclusive;
 
     // In-memory discovery cache for CalDAV
     bool calendarsDiscoveryComplete = false;
@@ -94,6 +96,11 @@ public:
     void run();
     
     shared_ptr<ContactBook> resolveAddressBook();
+    // #286: kandydaci na host CardDAV (jak calendarHostCandidates) i pełny
+    // łańcuch na JEDNYM hoście: .well-known/carddav → current-user-principal →
+    // addressbook-home-set. Zwraca URL home-setu albo "".
+    vector<string> addressBookHostCandidates();
+    string discoverAddressBookHomeAt(const string & cardHost);
     string resolveCalendarHomeURL();
 
     // #267: kandydaci na host CalDAV, w kolejności prób — jawne ustawienie
