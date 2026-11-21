@@ -77,6 +77,11 @@ public:
 
     void beginConnectionError(string accountId);
     void endConnectionError(string accountId);
+
+    // #341 — wynik discovery CalDAV dla aplikacji ("unsupported" | "available").
+    // Jak ProcessState: delta procesu, nie model bazy; aplikacja utrwala go
+    // w ustawieniach konta (MailsyncBridge → settings.caldav_discovery).
+    void sendCalendarDiscoveryStatus(string accountId, string status);
 };
 
 

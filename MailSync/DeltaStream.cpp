@@ -215,6 +215,12 @@ void DeltaStream::beginConnectionError(string accountId) {
     emit(DeltaStreamItem("persist", "ProcessState", items), 0);
 }
 
+void DeltaStream::sendCalendarDiscoveryStatus(string accountId, string status) {
+    vector<json> items {};
+    items.push_back({{"accountId", accountId}, {"id", accountId}, {"status", status}});
+    emit(DeltaStreamItem("persist", "ProcessCalendarDiscovery", items), 0);
+}
+
 void DeltaStream::endConnectionError(string accountId) {
     if (connectionError) {
         connectionError = false;

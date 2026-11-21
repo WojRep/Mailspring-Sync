@@ -27,6 +27,7 @@
 #include <iostream>
 #include <set>
 #include <string>
+#include "DAVDiscoveryOutcome.hpp"
 #include <vector>
 
 #include "spdlog/spdlog.h"
@@ -50,6 +51,8 @@ class DAVWorker {
 
     // In-memory discovery cache for CalDAV
     bool calendarsDiscoveryComplete = false;
+    // #341 — werdykt ostatniego resolveCalendarHomeURL() (DAVDiscoveryOutcome.hpp).
+    CalDAVDiscoveryVerdict lastCalendarDiscoveryVerdict = CalDAVDiscoveryVerdict::Inconclusive;
     string cachedCalendarHomeURL = "";
 
     bool validateCachedAddressBook();

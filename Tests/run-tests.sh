@@ -55,4 +55,8 @@ echo "== dav-auth-policy-test (bezpieczeństwo poświadczeń CalDAV)"
 clang++ "${CXXFLAGS[@]}" "$ROOT/Tests/dav-auth-policy-test.cpp" -o "$OUT/dav-auth-policy-test" \
   && "$OUT/dav-auth-policy-test" || status=1
 
+echo "== dav-discovery-outcome-test (#341 serwer bez CalDAV)"
+clang++ "${CXXFLAGS[@]}" "$ROOT/Tests/dav-discovery-outcome-test.cpp" -o "$OUT/dav-discovery-outcome-test" \
+  && "$OUT/dav-discovery-outcome-test" || status=1
+
 exit $status

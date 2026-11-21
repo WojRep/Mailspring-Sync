@@ -22,6 +22,7 @@
 #include "Event.hpp"
 #include "Calendar.hpp"
 #include "NetworkRequestUtils.hpp"
+#include "DeltaStream.hpp"
 #include "icalendar.h"
 
 #include <string>
@@ -697,29 +698,42 @@ vector<string> DAVWorker::calendarHostCandidates() {
 }
 
 string DAVWorker::resolveCalendarHomeURL() {
+    lastCalendarDiscoveryVerdict = CalDAVDiscoveryVerdict::Inconclusive;
     vector<string> candidates = calendarHostCandidates();
     if (candidates.empty()) {
         logger->info("CalDAV: no candidate host for discovery, skipping calendar sync");
         return "";
     }
 
+    // #341 — kod odpowiedzi każdego kandydata, do odróżnienia „serwer nie ma
+    // CalDAV" od wyniku niepewnego (DAVDiscoveryOutcome.hpp).
+    vector<int> candidateCodes;
     for (const string & host : candidates) {
         try {
             string homeSet = discoverCalendarHomeAt(host);
             if (!homeSet.empty()) {
                 logger->info("CalDAV: calendar home-set discovered via host {}", host);
+                lastCalendarDiscoveryVerdict = classifyCalDAVDiscovery(candidateCodes, true);
                 return homeSet;
             }
+            // Odpowiedź bez wyjątku = poprawny XML DAV, tylko bez principal/home-set.
+            candidateCodes.push_back(207);
             logger->info("CalDAV: host {} did not yield a calendar home-set", host);
         } catch (SyncException & e) {
             // Awaria sieci jest przejściowa — niech zdecyduje runCalendars()
             // (nie zamyka discovery na stałe, spróbuje w kolejnym cyklu).
             if (e.isOffline()) throw;
+            candidateCodes.push_back(davHTTPCodeFromErrorKey(e.key));
             logger->info("CalDAV: discovery on host {} failed ({}), trying next", host, e.key);
         }
     }
 
-    logger->info("CalDAV: no calendar home-set found (tried {} candidate host(s))", candidates.size());
+    lastCalendarDiscoveryVerdict = classifyCalDAVDiscovery(candidateCodes, false);
+    if (lastCalendarDiscoveryVerdict == CalDAVDiscoveryVerdict::NoCalDAV) {
+        logger->info("CalDAV: server does not provide CalDAV (all {} candidate host(s) answered 404/405/406)", candidates.size());
+    } else {
+        logger->info("CalDAV: no calendar home-set found (tried {} candidate host(s))", candidates.size());
+    }
     return "";
 }
 
@@ -1483,6 +1497,12 @@ void DAVWorker::runCalendars() {
                 logger->info("Performing CalDAV calendar home-set discovery");
                 cachedCalendarHomeURL = resolveCalendarHomeURL();
                 calendarsDiscoveryComplete = true;
+                // #341 — rozstrzygnięty wynik trafia do aplikacji (komunikat
+                // przy koncie). Niepewny — nic nie zgłaszamy, stan zostaje.
+                string status = calDAVDiscoveryStatusName(lastCalendarDiscoveryVerdict);
+                if (!status.empty()) {
+                    SharedDeltaStream()->sendCalendarDiscoveryStatus(account->id(), status);
+                }
             } catch (SyncException & e) {
                 if (e.key.find("404") != string::npos ||
                     e.key.find("405") != string::npos ||
